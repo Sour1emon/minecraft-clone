@@ -7,686 +7,646 @@ import SimplexNoise from "simplex-noise";
 let camera, scene, renderer, controls;
 let raycaster;
 let directionalLight, ambientLight;
-let timeOfDay = 0; // 0 to 2PI
+let timeOfDay = 0;
 
 // Rapier Physics
 let world, characterController, playerBody, playerCollider;
 
-// Movement & Physics
-const objects = []; // Array of interactable blocks
-const blockMap = new Map(); // "x,y,z" -> mesh for fast lookup
-let moveForward = false;
-let moveBackward = false;
-let moveLeft = false;
-let moveRight = false;
+let moveForward = false, moveBackward = false, moveLeft = false, moveRight = false;
 let canJump = false;
+let renderDistance = 10;
+let isRebinding = false;
 
-let renderDistance = 50;
-let isRebinding = false; // Flag to stop other key interactions while waiting for a key press
-
-// Keybind settings mapping action to actual event.code or mouse button
 const keyBinds = {
-  forward: "KeyW",
-  backward: "KeyS",
-  left: "KeyA",
-  right: "KeyD",
-  jump: "Space",
-  inventory: "KeyE",
-  breakBlock: "Mouse0",
-  placeBlock: "Mouse2",
-  slot1: "Digit1",
-  slot2: "Digit2",
-  slot3: "Digit3",
-  slot4: "Digit4",
-  slot5: "Digit5",
-  slot6: "Digit6",
-  slot7: "Digit7",
-  slot8: "Digit8",
-  slot9: "Digit9",
+  forward: "KeyW", backward: "KeyS", left: "KeyA", right: "KeyD",
+  jump: "Space", inventory: "KeyE", breakBlock: "Mouse0", placeBlock: "Mouse2",
+  slot1:"Digit1",slot2:"Digit2",slot3:"Digit3",slot4:"Digit4",slot5:"Digit5",
+  slot6:"Digit6",slot7:"Digit7",slot8:"Digit8",slot9:"Digit9",
 };
 
 let prevTime = performance.now();
 const velocity = new THREE.Vector3();
-const direction = new THREE.Vector3();
+let lastInventoryUpdate = 0;
+const INVENTORY_UPDATE_THROTTLE = 50;
+const BASE_PIXEL_RATIO = Math.min(window.devicePixelRatio, 2);
+let currentPixelRatio = BASE_PIXEL_RATIO;
+let targetPixelRatio = BASE_PIXEL_RATIO;
+let smoothedFrameMs = 16.7;
+let lastDprEval = 0;
+
+// --- Chunk System ---
+const CHUNK_SIZE = 16;
+// blockMap: "x,y,z" -> blockType string. Single source of truth for world state.
+const blockMap = new Map();
+// chunkMeshes: "cx,cz" -> { opaque: Mesh, transparent: Mesh } (rebuilt on change)
+const chunkMeshes = new Map();
+// Chunks dirty-flagged for rebuild next frame
+const dirtyChunks = new Set();
+// Raycaster target list (opaque chunk meshes within range)
+const visibleObjects = [];
+
+const PHYSICS_CULLING_DISTANCE = 30;
+// blockPhysics: "x,y,z" -> RAPIER rigidBody
+const blockPhysics = new Map();
+// Reused materials keyed by "texture|opaque/transparent"
+const materialCache = new Map();
+
+// Preallocated per-frame vectors
+const _right = new THREE.Vector3();
+const _front = new THREE.Vector3();
+const _up = new THREE.Vector3(0, 1, 0);
+const _moveVec = new THREE.Vector3();
+const _blockMatrix = new THREE.Matrix4();
+const _screenCenter = new THREE.Vector2(0, 0);
+let _rapierMovement = null;
+let needsVisibleRebuild = true;
+let lastPlayerChunkX = Number.NaN;
+let lastPlayerChunkZ = Number.NaN;
 
 // --- Texture Generation ---
-const iconUris = {}; // Map block type to base64 image URI for HTML UI
+const iconUris = {};
+const textureCache = {};
 
 function generateTexture(type) {
+  if (textureCache[type]) return textureCache[type];
   const canvas = document.createElement("canvas");
-  canvas.width = 16;
-  canvas.height = 16;
-  const ctx = canvas.getContext("2d");
-
+  canvas.width = 16; canvas.height = 16;
+  const ctx = canvas.getContext("2d", { alpha: true });
   const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 
-  // Base colors
   let baseColor, noiseColors;
-  if (type === "dirt") {
-    baseColor = [139, 69, 19];
-    noiseColors = [
-      [107, 52, 16],
-      [155, 86, 32],
-    ];
-  } else if (type === "stone") {
-    baseColor = [128, 128, 128];
-    noiseColors = [
-      [100, 100, 100],
-      [150, 150, 150],
-    ];
-  } else if (type === "grass_top") {
-    baseColor = [85, 170, 85];
-    noiseColors = [
-      [68, 153, 68],
-      [102, 187, 102],
-    ];
-  } else if (type === "wood_top") {
-    baseColor = [139, 90, 43];
-    noiseColors = [
-      [120, 75, 35],
-      [150, 100, 50],
-    ];
-  } else if (type === "sand") {
-    baseColor = [238, 214, 175];
-    noiseColors = [
-      [200, 180, 140],
-      [255, 230, 190],
-    ];
-  } else if (type === "brick") {
-    ctx.fillStyle = "#aaa"; // Mortar base
-    ctx.fillRect(0, 0, 16, 16);
-    ctx.fillStyle = "#b22222"; // Brick red
-    // Rows of bricks
-    for (let r = 0; r < 4; r++) {
-      let offset = r % 2 === 0 ? 0 : -8;
-      for (let c = 0; c < 2; c++) {
-        ctx.fillRect(c * 16 + offset, r * 4, 15, 3);
-      }
-    }
-    for (let i = 0; i < 30; i++) {
-      let x = rand(0, 15),
-        y = rand(0, 15);
-      ctx.fillStyle = `rgba(0,0,0,0.2)`;
-      ctx.fillRect(x, y, 1, 1);
-    }
+  if (type === "dirt") { baseColor=[139,69,19]; noiseColors=[[107,52,16],[155,86,32]]; }
+  else if (type === "stone") { baseColor=[128,128,128]; noiseColors=[[100,100,100],[150,150,150]]; }
+  else if (type === "grass_top") { baseColor=[85,170,85]; noiseColors=[[68,153,68],[102,187,102]]; }
+  else if (type === "wood_top") { baseColor=[139,90,43]; noiseColors=[[120,75,35],[150,100,50]]; }
+  else if (type === "sand") { baseColor=[238,214,175]; noiseColors=[[200,180,140],[255,230,190]]; }
+  else if (type === "brick") {
+    ctx.fillStyle="#aaa"; ctx.fillRect(0,0,16,16);
+    ctx.fillStyle="#b22222";
+    for (let r=0;r<4;r++){let o=r%2===0?0:-8;for(let c=0;c<2;c++)ctx.fillRect(c*16+o,r*4,15,3);}
+    for (let i=0;i<30;i++){ctx.fillStyle=`rgba(0,0,0,0.2)`;ctx.fillRect(rand(0,15),rand(0,15),1,1);}
   } else if (type === "glass") {
-    ctx.clearRect(0, 0, 16, 16);
-    ctx.fillStyle = "rgba(200,220,255,0.4)";
-    ctx.fillRect(0, 0, 16, 16);
-    ctx.fillStyle = "rgba(255,255,255,0.8)";
-    ctx.fillRect(0, 0, 16, 2); // Top frame
-    ctx.fillRect(0, 14, 16, 2); // Bottom frame
-    ctx.fillRect(0, 0, 2, 16); // Left frame
-    ctx.fillRect(14, 0, 2, 16); // Right frame
-    ctx.fillRect(2, 2, 4, 4); // Glint
+    ctx.clearRect(0,0,16,16); ctx.fillStyle="rgba(200,220,255,0.4)"; ctx.fillRect(0,0,16,16);
+    ctx.fillStyle="rgba(255,255,255,0.8)";
+    ctx.fillRect(0,0,16,2);ctx.fillRect(0,14,16,2);ctx.fillRect(0,0,2,16);ctx.fillRect(14,0,2,16);ctx.fillRect(2,2,4,4);
   }
-
   if (type === "grass_side") {
-    for (let y = 0; y < 16; y++) {
-      for (let x = 0; x < 16; x++) {
-        // Top a few pixels green, bottom dirt
-        let isGrass = y < 4 || (y < 6 && Math.random() > 0.5);
-        let c;
-        if (isGrass) {
-          c = Math.random() > 0.5 ? [85, 170, 85] : [68, 153, 68];
-        } else {
-          c = Math.random() > 0.5 ? [139, 69, 19] : [107, 52, 16];
-        }
-        ctx.fillStyle = `rgb(${c[0]},${c[1]},${c[2]})`;
-        ctx.fillRect(x, y, 1, 1);
-      }
+    for (let y=0;y<16;y++) for (let x=0;x<16;x++) {
+      let isG=y<4||(y<6&&Math.random()>0.5);
+      let c=isG?(Math.random()>0.5?[85,170,85]:[68,153,68]):(Math.random()>0.5?[139,69,19]:[107,52,16]);
+      ctx.fillStyle=`rgb(${c[0]},${c[1]},${c[2]})`; ctx.fillRect(x,y,1,1);
     }
   } else if (type === "wood_side") {
-    for (let y = 0; y < 16; y++) {
-      for (let x = 0; x < 16; x++) {
-        let stripe = (x + Math.floor(Math.random() * 1.5)) % 4;
-        let c = stripe < 2 ? [107, 66, 38] : [74, 46, 27];
-        ctx.fillStyle = `rgb(${c[0]},${c[1]},${c[2]})`;
-        ctx.fillRect(x, y, 1, 1);
-      }
+    for (let y=0;y<16;y++) for (let x=0;x<16;x++) {
+      let s=(x+Math.floor(Math.random()*1.5))%4;
+      let c=s<2?[107,66,38]:[74,46,27];
+      ctx.fillStyle=`rgb(${c[0]},${c[1]},${c[2]})`; ctx.fillRect(x,y,1,1);
     }
   } else if (type === "leaves") {
-    ctx.fillStyle = `rgb(34, 139, 34)`;
-    ctx.fillRect(0, 0, 16, 16);
-    for (let i = 0; i < 150; i++) {
-      let x = rand(0, 15);
-      let y = rand(0, 15);
-      let p = Math.random();
-      if (p < 0.4) {
-        ctx.clearRect(x, y, 1, 1);
-      } else {
-        ctx.fillStyle = p < 0.7 ? "rgb(17,119,17)" : "rgb(50,170,50)";
-        ctx.fillRect(x, y, 1, 1);
-      }
-    }
-  } else if (
-    ["dirt", "stone", "grass_top", "wood_top", "sand"].includes(type)
-  ) {
-    // Standard noise fill
-    ctx.fillStyle = `rgb(${baseColor[0]},${baseColor[1]},${baseColor[2]})`;
-    ctx.fillRect(0, 0, 16, 16);
-    for (let i = 0; i < 150; i++) {
-      let x = rand(0, 15);
-      let y = rand(0, 15);
-      let nc = noiseColors[rand(0, 1)];
-      ctx.fillStyle = `rgb(${nc[0]},${nc[1]},${nc[2]})`;
-      ctx.fillRect(x, y, 1, 1);
-    }
+    ctx.fillStyle=`rgb(34,139,34)`; ctx.fillRect(0,0,16,16);
+    for (let i=0;i<150;i++){let x=rand(0,15),y=rand(0,15),p=Math.random();
+      if(p<0.4)ctx.clearRect(x,y,1,1);else{ctx.fillStyle=p<0.7?"rgb(17,119,17)":"rgb(50,170,50)";ctx.fillRect(x,y,1,1);}}
+  } else if (["dirt","stone","grass_top","wood_top","sand"].includes(type)) {
+    ctx.fillStyle=`rgb(${baseColor[0]},${baseColor[1]},${baseColor[2]})`; ctx.fillRect(0,0,16,16);
+    for (let i=0;i<150;i++){let nc=noiseColors[rand(0,1)];ctx.fillStyle=`rgb(${nc[0]},${nc[1]},${nc[2]})`;ctx.fillRect(rand(0,15),rand(0,15),1,1);}
   }
-
-  iconUris[type] = canvas.toDataURL(); // Cache for the UI HTML rendering
-
+  iconUris[type] = canvas.toDataURL();
   const texture = new THREE.CanvasTexture(canvas);
-  texture.magFilter = THREE.NearestFilter; // Minecraft pixelated look
+  texture.magFilter = THREE.NearestFilter;
   texture.minFilter = THREE.NearestFilter;
   texture.colorSpace = THREE.SRGBColorSpace;
+  textureCache[type] = texture;
   return texture;
 }
 
-const getMat = (type, trans = false) =>
-  new THREE.MeshLambertMaterial({
-    map: generateTexture(type),
-    transparent: trans,
-    alphaTest: trans ? 0.1 : 0,
-  });
-
-const texDirt = getMat("dirt");
-const texGrassTop = getMat("grass_top");
-const texGrassSide = getMat("grass_side");
-const texStone = getMat("stone");
-const texWoodTop = getMat("wood_top");
-const texWoodSide = getMat("wood_side");
-const texLeaves = getMat("leaves", true);
-const texSand = getMat("sand");
-const texBrick = getMat("brick");
-const texGlass = getMat("glass", true);
-
-// Map complex block types to specific icons for the inventory
+// Pre-generate all textures up front so there's no stutter on first block of each type
+const TEX_TYPES = ["dirt","stone","grass_top","grass_side","wood_top","wood_side","leaves","sand","brick","glass"];
+TEX_TYPES.forEach(generateTexture);
 iconUris["grass"] = iconUris["grass_side"];
 iconUris["wood"] = iconUris["wood_side"];
 
-// BoxGeometry faces: right, left, top, bottom, front, back
-const materials = {
-  grass: [
-    texGrassSide,
-    texGrassSide,
-    texGrassTop,
-    texDirt,
-    texGrassSide,
-    texGrassSide,
-  ],
-  dirt: texDirt,
-  stone: texStone,
-  wood: [
-    texWoodSide,
-    texWoodSide,
-    texWoodTop,
-    texWoodTop,
-    texWoodSide,
-    texWoodSide,
-  ],
-  leaves: texLeaves,
-  sand: texSand,
-  brick: texBrick,
-  glass: texGlass,
-};
-
-const blockTypes = [
-  "grass",
-  "dirt",
-  "stone",
-  "wood",
-  "leaves",
-  "sand",
-  "brick",
-  "glass",
+// --- Chunk Mesh Builder ---
+// Face definitions: [normal dx,dy,dz], [4 vertices as offsets from block center], [uv coords]
+// Vertex winding is CCW from outside.
+const FACES = [
+  // +X right
+  { dir:[1,0,0],  verts:[[0.5,-0.5,-0.5],[0.5,0.5,-0.5],[0.5,0.5,0.5],[0.5,-0.5,0.5]],   uvs:[[0,0],[0,1],[1,1],[1,0]] },
+  // -X left
+  { dir:[-1,0,0], verts:[[-0.5,-0.5,0.5],[-0.5,0.5,0.5],[-0.5,0.5,-0.5],[-0.5,-0.5,-0.5]], uvs:[[0,0],[0,1],[1,1],[1,0]] },
+  // +Y top
+  { dir:[0,1,0],  verts:[[-0.5,0.5,-0.5],[-0.5,0.5,0.5],[0.5,0.5,0.5],[0.5,0.5,-0.5]],   uvs:[[0,0],[0,1],[1,1],[1,0]] },
+  // -Y bottom
+  { dir:[0,-1,0], verts:[[-0.5,-0.5,0.5],[-0.5,-0.5,-0.5],[0.5,-0.5,-0.5],[0.5,-0.5,0.5]], uvs:[[0,0],[0,1],[1,1],[1,0]] },
+  // +Z front
+  { dir:[0,0,1],  verts:[[-0.5,-0.5,0.5],[0.5,-0.5,0.5],[0.5,0.5,0.5],[-0.5,0.5,0.5]],   uvs:[[0,0],[1,0],[1,1],[0,1]] },
+  // -Z back
+  { dir:[0,0,-1], verts:[[0.5,-0.5,-0.5],[-0.5,-0.5,-0.5],[-0.5,0.5,-0.5],[0.5,0.5,-0.5]], uvs:[[0,0],[1,0],[1,1],[0,1]] },
 ];
-let currentMaterialType = "grass";
 
-const blockGeometry = new THREE.BoxGeometry(1, 1, 1);
+// Returns which texture to use for a given block type + face direction
+function getFaceTexture(blockType, faceDir) {
+  if (blockType === "grass") {
+    if (faceDir[1] === 1) return "grass_top";
+    if (faceDir[1] === -1) return "dirt";
+    return "grass_side";
+  }
+  if (blockType === "wood") {
+    if (faceDir[1] !== 0) return "wood_top";
+    return "wood_side";
+  }
+  return blockType; // dirt, stone, sand, brick, glass, leaves all use single texture
+}
 
-// Highlight / Selection Box
+const TRANSPARENT_TYPES = new Set(["glass", "leaves"]);
+
+// Build or rebuild the mesh for one chunk.
+// Iterates all blocks in the chunk, emits only faces whose neighbor is absent.
+// Produces two meshes: opaque (single material atlas approach via groups) and transparent.
+function buildChunkMesh(chunkX, chunkZ) {
+  // Separate geometry arrays per texture type to avoid texture atlas complexity
+  // Key: textureName -> { positions, normals, uvs, indices }
+  const opaqueBufs = {};   // texName -> arrays
+  const transBufs = {};    // texName -> arrays
+
+  const x0 = chunkX * CHUNK_SIZE;
+  const z0 = chunkZ * CHUNK_SIZE;
+
+  // Scan all blocks in this chunk by checking blockMap entries
+  // We use a bounding scan — faster than filtering the whole blockMap
+  for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+    for (let lz = 0; lz < CHUNK_SIZE; lz++) {
+      const wx = x0 + lx;
+      const wz = z0 + lz;
+      // Find all y values at this column that have a block
+      // We scan a vertical range — adjust min/max if your world is taller
+      for (let wy = -10; wy < 30; wy++) {
+        const blockType = blockMap.get(`${wx},${wy},${wz}`);
+        if (!blockType) continue;
+
+        const isTransparent = TRANSPARENT_TYPES.has(blockType);
+
+        for (const face of FACES) {
+          const [dx, dy, dz] = face.dir;
+          const neighborKey = `${wx+dx},${wy+dy},${wz+dz}`;
+          const neighbor = blockMap.get(neighborKey);
+
+          // Skip this face if neighbor is a fully opaque block
+          // (transparent blocks always show their faces next to other transparent blocks)
+          if (neighbor && !TRANSPARENT_TYPES.has(neighbor)) continue;
+          // Also skip if both are same transparent type (glass next to glass hides the face)
+          if (neighbor && isTransparent && neighbor === blockType) continue;
+
+          const texName = getFaceTexture(blockType, face.dir);
+          const bufs = isTransparent ? transBufs : opaqueBufs;
+          if (!bufs[texName]) bufs[texName] = { positions:[], normals:[], uvs:[], indices:[] };
+          const buf = bufs[texName];
+
+          const base = buf.positions.length / 3; // vertex index base
+          for (let v = 0; v < 4; v++) {
+            const [vx,vy,vz] = face.verts[v];
+            buf.positions.push(wx+vx, wy+vy, wz+vz);
+            buf.normals.push(dx, dy, dz);
+            buf.uvs.push(face.uvs[v][0], face.uvs[v][1]);
+          }
+          // Two triangles per quad (CCW)
+          buf.indices.push(base, base+1, base+2, base, base+2, base+3);
+        }
+      }
+    }
+  }
+
+  return { opaqueBufs, transBufs };
+}
+
+// Creates Three.js meshes from geometry buffers for one chunk
+function createChunkMeshObjects(chunkX, chunkZ, opaqueBufs, transBufs) {
+  const meshes = [];
+
+  const getChunkMaterial = (texName, transparent) => {
+    const key = `${texName}|${transparent ? "t" : "o"}`;
+    let mat = materialCache.get(key);
+    if (!mat) {
+      mat = new THREE.MeshLambertMaterial({
+        map: generateTexture(texName),
+        transparent,
+        alphaTest: transparent ? 0.1 : 0,
+        side: transparent ? THREE.DoubleSide : THREE.FrontSide,
+      });
+      materialCache.set(key, mat);
+    }
+    return mat;
+  };
+
+  const buildMeshes = (bufs, transparent) => {
+    for (const [texName, buf] of Object.entries(bufs)) {
+      if (buf.indices.length === 0) continue;
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.Float32BufferAttribute(buf.positions, 3));
+      geo.setAttribute("normal",   new THREE.Float32BufferAttribute(buf.normals, 3));
+      geo.setAttribute("uv",       new THREE.Float32BufferAttribute(buf.uvs, 2));
+      geo.setIndex(buf.indices);
+
+      const mat = getChunkMaterial(texName, transparent);
+
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.castShadow = !transparent;
+      mesh.receiveShadow = true;
+      mesh.userData = { chunkX, chunkZ, isTransparent: transparent };
+      scene.add(mesh);
+      meshes.push(mesh);
+    }
+  };
+
+  buildMeshes(opaqueBufs, false);
+  buildMeshes(transBufs, true);
+  return meshes;
+}
+
+// Remove existing chunk meshes from scene and dispose GPU resources
+function disposeChunkMeshes(chunkKey) {
+  const existing = chunkMeshes.get(chunkKey);
+  if (!existing) return;
+  for (const mesh of existing) {
+    scene.remove(mesh);
+    mesh.geometry.dispose();
+    // Don't dispose materials/textures — they're shared across chunks
+  }
+  chunkMeshes.delete(chunkKey);
+}
+
+// Full rebuild for one chunk — called when dirty
+function rebuildChunk(chunkX, chunkZ) {
+  const chunkKey = `${chunkX},${chunkZ}`;
+  disposeChunkMeshes(chunkKey);
+  const { opaqueBufs, transBufs } = buildChunkMesh(chunkX, chunkZ);
+  const meshes = createChunkMeshObjects(chunkX, chunkZ, opaqueBufs, transBufs);
+  chunkMeshes.set(chunkKey, meshes);
+}
+
+// Mark a chunk and its face-adjacent neighbors dirty (needed when a block on a border changes)
+function markChunkDirty(wx, wy, wz) {
+  const cx = Math.floor(wx / CHUNK_SIZE);
+  const cz = Math.floor(wz / CHUNK_SIZE);
+  dirtyChunks.add(`${cx},${cz}`);
+  // If block is on a chunk border, the adjacent chunk face-culling is also affected
+  const lx = ((wx % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+  const lz = ((wz % CHUNK_SIZE) + CHUNK_SIZE) % CHUNK_SIZE;
+  if (lx === 0)             dirtyChunks.add(`${cx-1},${cz}`);
+  if (lx === CHUNK_SIZE-1)  dirtyChunks.add(`${cx+1},${cz}`);
+  if (lz === 0)             dirtyChunks.add(`${cx},${cz-1}`);
+  if (lz === CHUNK_SIZE-1)  dirtyChunks.add(`${cx},${cz+1}`);
+}
+
+function flushDirtyChunks() {
+  if (dirtyChunks.size === 0) return;
+  const start = performance.now();
+  const MAX_CHUNK_REBUILDS_PER_FRAME = 2;
+  const MAX_CHUNK_REBUILD_TIME_MS = 3;
+  let rebuilt = 0;
+
+  while (dirtyChunks.size > 0 && rebuilt < MAX_CHUNK_REBUILDS_PER_FRAME) {
+    const key = dirtyChunks.values().next().value;
+    dirtyChunks.delete(key);
+    const [cx, cz] = key.split(",").map(Number);
+    rebuildChunk(cx, cz);
+    rebuilt++;
+    if (performance.now() - start >= MAX_CHUNK_REBUILD_TIME_MS) break;
+  }
+
+  // Delay visible list rebuild to the periodic culling step to avoid repeated scans in one frame.
+  if (rebuilt > 0) needsVisibleRebuild = true;
+}
+
+// --- Block Map Helpers ---
+function addBlock(x, y, z, type) {
+  const posKey = `${x},${y},${z}`;
+  if (blockMap.has(posKey)) return;
+  blockMap.set(posKey, type);
+  markChunkDirty(x, y, z);
+}
+
+function removeBlock(posKey) {
+  if (!blockMap.has(posKey)) return;
+  // Parse position from key
+  const [x, y, z] = posKey.split(",").map(Number);
+  blockMap.delete(posKey);
+  markChunkDirty(x, y, z);
+  // Remove physics if present
+  const body = blockPhysics.get(posKey);
+  if (body) { world.removeRigidBody(body); blockPhysics.delete(posKey); }
+}
+
+function clearWorld() {
+  // Remove all chunk meshes
+  for (const [key] of chunkMeshes) disposeChunkMeshes(key);
+  chunkMeshes.clear();
+  blockMap.clear();
+  blockPhysics.forEach(body => world.removeRigidBody(body));
+  blockPhysics.clear();
+  dirtyChunks.clear();
+  visibleObjects.length = 0;
+  needsVisibleRebuild = true;
+  playerBody.setTranslation(new RAPIER.Vector3(0, 5, 0), true);
+  velocity.set(0, 0, 0);
+}
+
+// Rebuild the raycaster target list from visible opaque chunk meshes
+function rebuildVisibleObjects() {
+  visibleObjects.length = 0;
+  const playerPos = camera ? camera.position : new THREE.Vector3();
+  for (const [key, meshes] of chunkMeshes) {
+    const [cx, cz] = key.split(",").map(Number);
+    const chunkWorldX = cx * CHUNK_SIZE + CHUNK_SIZE / 2;
+    const chunkWorldZ = cz * CHUNK_SIZE + CHUNK_SIZE / 2;
+    const dist = Math.hypot(playerPos.x - chunkWorldX, playerPos.z - chunkWorldZ);
+    if (dist < renderDistance) {
+      for (const mesh of meshes) {
+        if (!mesh.userData.isTransparent) visibleObjects.push(mesh);
+      }
+    }
+  }
+}
+
+// --- Physics ---
+function updatePhysicsBodies(playerPos) {
+  const chunkRadius = Math.ceil(PHYSICS_CULLING_DISTANCE / CHUNK_SIZE) + 1;
+  const playerChunkX = Math.floor(playerPos.x / CHUNK_SIZE);
+  const playerChunkZ = Math.floor(playerPos.z / CHUNK_SIZE);
+
+  // Add physics for nearby blocks that lack it
+  for (let cx = playerChunkX - chunkRadius; cx <= playerChunkX + chunkRadius; cx++) {
+    for (let cz = playerChunkZ - chunkRadius; cz <= playerChunkZ + chunkRadius; cz++) {
+      // Scan blocks in this chunk column range
+      for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+        for (let lz = 0; lz < CHUNK_SIZE; lz++) {
+          const wx = cx * CHUNK_SIZE + lx;
+          const wz = cz * CHUNK_SIZE + lz;
+          for (let wy = -10; wy < 30; wy++) {
+            const posKey = `${wx},${wy},${wz}`;
+            if (!blockMap.has(posKey) || blockPhysics.has(posKey)) continue;
+            const dist = Math.hypot(wx - playerPos.x, wy - playerPos.y, wz - playerPos.z);
+            if (dist < PHYSICS_CULLING_DISTANCE) {
+              const rb = world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(wx, wy, wz));
+              world.createCollider(RAPIER.ColliderDesc.cuboid(0.5, 0.5, 0.5), rb);
+              blockPhysics.set(posKey, rb);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Remove physics for blocks now out of range
+  for (const [posKey, rb] of blockPhysics) {
+    const [x, y, z] = posKey.split(",").map(Number);
+    const dist = Math.hypot(x - playerPos.x, y - playerPos.y, z - playerPos.z);
+    if (dist >= PHYSICS_CULLING_DISTANCE) {
+      world.removeRigidBody(rb);
+      blockPhysics.delete(posKey);
+    }
+  }
+}
+
+// --- World Generation ---
+function generateWorld() {
+  const simplex = new SimplexNoise();
+  const gridSize = 40;
+  const columns = [];
+  for (let x = -gridSize/2; x < gridSize/2; x++)
+    for (let z = -gridSize/2; z < gridSize/2; z++)
+      columns.push([x, z]);
+
+  // Process in batches to avoid freezing the main thread
+  const BATCH_SIZE = 80;
+  let idx = 0;
+
+  function processBatch() {
+    const end = Math.min(idx + BATCH_SIZE, columns.length);
+    for (; idx < end; idx++) {
+      const [x, z] = columns[idx];
+      const yStr = (simplex.noise2D(x / 20, z / 20) + 1) / 2;
+      const height = Math.floor(yStr * 8);
+      for (let y = -4; y < height - 2; y++) blockMap.set(`${x},${y},${z}`, "stone");
+      for (let y = Math.max(-4, height-2); y < height; y++) blockMap.set(`${x},${y},${z}`, "dirt");
+      const topType = height <= 1 ? "sand" : "grass";
+      blockMap.set(`${x},${height},${z}`, topType);
+      if (topType === "grass" && Math.random() < 0.01) addTreeToMap(x, height + 1, z);
+    }
+    if (idx < columns.length) {
+      requestAnimationFrame(processBatch);
+    } else {
+      // All blocks placed — now do one bulk chunk build pass
+      buildAllChunks();
+    }
+  }
+  requestAnimationFrame(processBatch);
+}
+
+function addTreeToMap(x, y, z) {
+  const h = Math.floor(Math.random() * 3) + 4;
+  for (let i = 0; i < h; i++) blockMap.set(`${x},${y+i},${z}`, "wood");
+  for (let lx = -2; lx <= 2; lx++) for (let lz = -2; lz <= 2; lz++) for (let ly = h-2; ly <= h+1; ly++) {
+    if (Math.abs(lx)===2 && Math.abs(lz)===2 && ly===h+1) continue;
+    if (lx===0 && lz===0 && ly<h) continue;
+    const key = `${x+lx},${y+ly},${z+lz}`;
+    if (!blockMap.has(key)) blockMap.set(key, "leaves");
+  }
+}
+
+// After world gen completes, find which chunks exist and build them all
+function buildAllChunks() {
+  const chunkSet = new Set();
+  for (const key of blockMap.keys()) {
+    const [x,,z] = key.split(",").map(Number);
+    chunkSet.add(`${Math.floor(x/CHUNK_SIZE)},${Math.floor(z/CHUNK_SIZE)}`);
+  }
+  // Build in batches too — each chunk build is ~1ms
+  const chunkList = [...chunkSet];
+  let ci = 0;
+  function buildBatch() {
+    const end = Math.min(ci + 4, chunkList.length);
+    for (; ci < end; ci++) {
+      const [cx, cz] = chunkList[ci].split(",").map(Number);
+      rebuildChunk(cx, cz);
+    }
+    if (ci < chunkList.length) requestAnimationFrame(buildBatch);
+    else needsVisibleRebuild = true;
+  }
+  requestAnimationFrame(buildBatch);
+}
+
+// --- Inventory ---
+let inventory = Array(36).fill(null);
+let hotbarSelected = 0;
+let isInventoryOpen = false;
+inventory[0]={type:"grass",count:64}; inventory[1]={type:"dirt",count:64};
+inventory[2]={type:"stone",count:64}; inventory[3]={type:"wood",count:64};
+inventory[4]={type:"leaves",count:64}; inventory[5]={type:"sand",count:64};
+inventory[6]={type:"brick",count:64}; inventory[7]={type:"glass",count:64};
+
 let rollOverMesh;
 
 init().then(animate);
 
 async function init() {
-  // --- Physics Setup ---
   await RAPIER.init();
   world = new RAPIER.World(new RAPIER.Vector3(0.0, -30.0, 0.0));
+  _rapierMovement = new RAPIER.Vector3(0, 0, 0);
 
-  // --- Scene Setup ---
   scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x87ceeb); // Sky blue
+  scene.background = new THREE.Color(0x87ceeb);
   scene.fog = new THREE.Fog(0x87ceeb, 10, renderDistance);
 
-  // --- Lighting ---
   ambientLight = new THREE.AmbientLight(0xeeeeee, 0.6);
   scene.add(ambientLight);
 
   directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
   directionalLight.position.set(50, 100, 50);
-  directionalLight.castShadow = true;
-  directionalLight.shadow.mapSize.width = 2048;
-  directionalLight.shadow.mapSize.height = 2048;
+  directionalLight.castShadow = false;
+  directionalLight.shadow.mapSize.width = 1024;
+  directionalLight.shadow.mapSize.height = 1024;
   directionalLight.shadow.camera.near = 0.5;
-  directionalLight.shadow.camera.far = 500;
+  directionalLight.shadow.camera.far = 200;
   directionalLight.shadow.camera.left = -50;
   directionalLight.shadow.camera.right = 50;
   directionalLight.shadow.camera.top = 50;
   directionalLight.shadow.camera.bottom = -50;
   directionalLight.shadow.bias = -0.001;
+  directionalLight.shadow.normalBias = 0.02;
   scene.add(directionalLight);
+  renderer = null; // will be set below
 
-  // --- Camera & Renderer ---
-  camera = new THREE.PerspectiveCamera(
-    75,
-    window.innerWidth / window.innerHeight,
-    0.1,
-    1000,
-  );
+  camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
 
-  renderer = new THREE.WebGLRenderer({ antialias: true });
-  renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-  renderer.setPixelRatio(window.devicePixelRatio);
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  document.body.appendChild(renderer.domElement);
+  const rendererInst = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+  rendererInst.shadowMap.enabled = true;
+  rendererInst.shadowMap.type = THREE.PCFShadowMap;
+  rendererInst.shadowMap.autoUpdate = false;
+  rendererInst.shadowMap.needsUpdate = true;
+  rendererInst.setPixelRatio(currentPixelRatio);
+  rendererInst.setSize(window.innerWidth, window.innerHeight);
+  rendererInst.outputColorSpace = THREE.SRGBColorSpace;
+  document.body.appendChild(rendererInst.domElement);
+  renderer = rendererInst;
 
-  // --- Controls ---
   controls = new PointerLockControls(camera, renderer.domElement);
 
   const blocker = document.getElementById("blocker");
-
-  // Menu panels
   const menuMain = document.getElementById("menu-main");
   const menuOptions = document.getElementById("menu-options");
   const menuGraphics = document.getElementById("menu-graphics");
   const menuControls = document.getElementById("menu-controls");
 
-  // UI functions
   function showMenu(menu) {
-    menuMain.style.display = "none";
-    menuOptions.style.display = "none";
-    menuGraphics.style.display = "none";
-    menuControls.style.display = "none";
+    [menuMain,menuOptions,menuGraphics,menuControls].forEach(m=>m.style.display="none");
     menu.style.display = "flex";
   }
 
-  // Main pause menu
-  document
-    .getElementById("btn-resume")
-    .addEventListener("click", () => controls.lock());
-  document
-    .getElementById("btn-options")
-    .addEventListener("click", () => showMenu(menuOptions));
-  document.getElementById("btn-exit").addEventListener("click", () => {
-    clearWorld();
-    generateWorld();
-    controls.lock(); // Optionally restart immediately
-  });
+  document.getElementById("btn-resume").addEventListener("click", ()=>controls.lock());
+  document.getElementById("btn-options").addEventListener("click", ()=>showMenu(menuOptions));
+  document.getElementById("btn-exit").addEventListener("click", ()=>{ clearWorld(); generateWorld(); controls.lock(); });
+  document.getElementById("btn-graphics").addEventListener("click", ()=>showMenu(menuGraphics));
+  document.getElementById("btn-controls").addEventListener("click", ()=>showMenu(menuControls));
+  document.getElementById("btn-options-done").addEventListener("click", ()=>showMenu(menuMain));
+  document.getElementById("btn-graphics-done").addEventListener("click", ()=>showMenu(menuOptions));
+  document.getElementById("btn-controls-done").addEventListener("click", ()=>showMenu(menuOptions));
 
-  // Options menu
-  document
-    .getElementById("btn-graphics")
-    .addEventListener("click", () => showMenu(menuGraphics));
-  document
-    .getElementById("btn-controls")
-    .addEventListener("click", () => showMenu(menuControls));
-  document
-    .getElementById("btn-options-done")
-    .addEventListener("click", () => showMenu(menuMain));
-
-  // Graphics Menu
   const sliderRenderDist = document.getElementById("graphics-render-distance");
   const lblRenderDist = document.getElementById("lbl-render-distance");
-  sliderRenderDist.addEventListener("input", (e) => {
+  sliderRenderDist.addEventListener("input", (e)=>{
     renderDistance = parseInt(e.target.value);
     lblRenderDist.innerText = `${renderDistance} chunks`;
     scene.fog.far = renderDistance;
+    needsVisibleRebuild = true;
   });
-  document
-    .getElementById("btn-graphics-done")
-    .addEventListener("click", () => showMenu(menuOptions));
 
-  // Controls Menu KeyBinding Logic
-  document.querySelectorAll(".keybind-btn").forEach((btn) => {
-    btn.addEventListener("click", (e) => {
+  document.querySelectorAll(".keybind-btn").forEach(btn=>{
+    btn.addEventListener("click", e=>{
       isRebinding = true;
       const targetBtn = e.target;
       const action = targetBtn.getAttribute("data-action");
-      targetBtn.innerText = ">"; // Visual cue
-
-      const handleBindKey = (ev) => {
-        ev.preventDefault();
-        finalizeBind(
-          ev.code,
-          ev.code === "Space" ? "SPACE" : ev.code.replace("Key", ""),
-        );
+      targetBtn.innerText = ">";
+      const handleKey = ev=>{ ev.preventDefault(); finalize(ev.code, ev.code==="Space"?"SPACE":ev.code.replace("Key","")); };
+      const handleMouse = ev=>{ ev.preventDefault(); finalize("Mouse"+ev.button,["Click L","Click M","Click R"][ev.button]||"Click"); };
+      const finalize = (code, display)=>{
+        keyBinds[action]=code; targetBtn.innerText=display;
+        document.removeEventListener("keydown",handleKey);
+        document.removeEventListener("mousedown",handleMouse);
+        setTimeout(()=>{ isRebinding=false; },50);
       };
-
-      const handleBindMouse = (ev) => {
-        ev.preventDefault();
-        let name = "Click L";
-        if (ev.button === 1) name = "Click M";
-        if (ev.button === 2) name = "Click R";
-        finalizeBind("Mouse" + ev.button, name);
-      };
-
-      const finalizeBind = (code, display) => {
-        keyBinds[action] = code;
-        targetBtn.innerText = display;
-        document.removeEventListener("keydown", handleBindKey);
-        document.removeEventListener("mousedown", handleBindMouse);
-        // Delay dropping the flag so the binding click itself doesn't trigger an in-game action
-        setTimeout(() => {
-          isRebinding = false;
-        }, 50);
-      };
-
-      // Use setTimeout so the current click doesn't trigger the mousedown listener instantly
-      setTimeout(() => {
-        document.addEventListener("keydown", handleBindKey);
-        document.addEventListener("mousedown", handleBindMouse);
-      }, 10);
+      setTimeout(()=>{ document.addEventListener("keydown",handleKey); document.addEventListener("mousedown",handleMouse); },10);
     });
   });
-  document
-    .getElementById("btn-controls-done")
-    .addEventListener("click", () => showMenu(menuOptions));
 
-  controls.addEventListener("lock", function () {
-    blocker.style.display = "none";
-  });
-
-  controls.addEventListener("unlock", function () {
-    blocker.style.display = "flex";
-    showMenu(menuMain); // Reset back to main pause context
-  });
-
+  controls.addEventListener("lock", ()=>{ blocker.style.display="none"; });
+  controls.addEventListener("unlock", ()=>{ blocker.style.display="flex"; showMenu(menuMain); });
   scene.add(controls.getObject());
 
-  // Create player physics body
-  const playerDesc =
-    RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(0, 5, 0);
+  const playerDesc = RAPIER.RigidBodyDesc.kinematicPositionBased().setTranslation(0, 5, 0);
   playerBody = world.createRigidBody(playerDesc);
-  const colliderDesc = RAPIER.ColliderDesc.capsule(0.8, 0.4); // height/2, radius
-  playerCollider = world.createCollider(colliderDesc, playerBody);
+  playerCollider = world.createCollider(RAPIER.ColliderDesc.capsule(0.8, 0.4), playerBody);
   characterController = world.createCharacterController(0.01);
   characterController.enableAutostep(0.5, 0.2, true);
   characterController.enableSnapToGround(0.5);
+  controls.getObject().position.y = 5;
 
-  controls.getObject().position.y = 5; // Spawn height
+  document.addEventListener("keydown", e=>{ if(!isRebinding) onInputDown(e.code); });
+  document.addEventListener("keyup",   e=>{ if(!isRebinding) onInputUp(e.code); });
+  document.addEventListener("mousedown", e=>{ if(!isRebinding) onInputDown("Mouse"+e.button); });
+  document.addEventListener("mouseup",   e=>{ if(!isRebinding) onInputUp("Mouse"+e.button); });
+  document.addEventListener("contextmenu", e=>e.preventDefault());
+  window.addEventListener("resize", ()=>{
+    clearTimeout(window._resizeT);
+    window._resizeT = setTimeout(()=>{
+      camera.aspect = window.innerWidth/window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setPixelRatio(currentPixelRatio);
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }, 150);
+  });
 
-  // --- Event Listeners ---
-  document.addEventListener("keydown", (e) => {
-    if (!isRebinding) onInputDown(e.code);
-  });
-  document.addEventListener("keyup", (e) => {
-    if (!isRebinding) onInputUp(e.code);
-  });
-  document.addEventListener("mousedown", (e) => {
-    if (!isRebinding) onInputDown("Mouse" + e.button);
-  });
-  document.addEventListener("mouseup", (e) => {
-    if (!isRebinding) onInputUp("Mouse" + e.button);
-  });
-  window.addEventListener("resize", onWindowResize);
-
-  // --- Raycaster & RollOver (Highlight) ---
   raycaster = new THREE.Raycaster();
+  raycaster.far = 6;
 
-  const rollOverGeo = new THREE.EdgesGeometry(blockGeometry);
-  const rollOverMaterial = new THREE.LineBasicMaterial({
-    color: 0x000000,
-    linewidth: 2,
-  });
-  rollOverMesh = new THREE.LineSegments(rollOverGeo, rollOverMaterial);
+  // Block highlight outline
+  const rollOverGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(1.002, 1.002, 1.002));
+  rollOverMesh = new THREE.LineSegments(rollOverGeo, new THREE.LineBasicMaterial({ color: 0x000000, linewidth: 2 }));
+  rollOverMesh.visible = false;
   scene.add(rollOverMesh);
 
-  // Initial UI render
   renderInventory();
   selectHotbarSlot(0);
-
-  // --- World Generation ---
   generateWorld();
 }
 
-let inventory = Array(36).fill(null); // 0-8 is hotbar, 9-35 is main inventory
-let hotbarSelected = 0; // 0 to 8
-let isInventoryOpen = false;
-
-// Give player some starting blocks
-inventory[0] = { type: "grass", count: 64 };
-inventory[1] = { type: "dirt", count: 64 };
-inventory[2] = { type: "stone", count: 64 };
-inventory[3] = { type: "wood", count: 64 };
-inventory[4] = { type: "leaves", count: 64 };
-inventory[5] = { type: "sand", count: 64 };
-inventory[6] = { type: "brick", count: 64 };
-inventory[7] = { type: "glass", count: 64 };
-
-function generateWorld() {
-  const simplex = new SimplexNoise();
-  const gridSize = 40; // Larger grid for terrain
-  for (let x = -gridSize / 2; x < gridSize / 2; x++) {
-    for (let z = -gridSize / 2; z < gridSize / 2; z++) {
-      // Base height using noise
-      const yStr = (simplex.noise2D(x / 20, z / 20) + 1) / 2; // 0 to 1
-      const height = Math.floor(yStr * 8); // 0 to 8 blocks high
-
-      // Stone foundation
-      for (let y = -4; y < height - 2; y++) {
-        addBlock(x, y, z, "stone");
-      }
-      // Dirt layer
-      for (let y = Math.max(-4, height - 2); y < height; y++) {
-        addBlock(x, y, z, "dirt");
-      }
-      // Grass layer / Sand near bottom
-      const topBlock = height <= 1 ? "sand" : "grass";
-      addBlock(x, height, z, topBlock);
-      
-      // Trees
-      if (topBlock === "grass" && Math.random() < 0.01) {
-         generateTree(x, height + 1, z);
-      }
-    }
-  }
-}
-
-function generateTree(x, y, z) {
-    const treeHeight = Math.floor(Math.random() * 3) + 4;
-    // Trunk
-    for (let i = 0; i < treeHeight; i++) {
-        addBlock(x, y + i, z, "wood");
-    }
-    // Leaves
-    for (let lx = -2; lx <= 2; lx++) {
-        for (let lz = -2; lz <= 2; lz++) {
-            for (let ly = treeHeight - 2; ly <= treeHeight + 1; ly++) {
-                // Shape leaves into a sphere-like cluster
-                if (Math.abs(lx) === 2 && Math.abs(lz) === 2 && ly === treeHeight + 1) continue;
-                if (lx === 0 && lz === 0 && ly < treeHeight) continue; // skip trunk blocks
-                addBlock(x + lx, y + ly, z + lz, "leaves");
-            }
-        }
-    }
-}
-
-function addBlock(x, y, z, type) {
-  const mesh = new THREE.Mesh(blockGeometry, materials[type]);
-  mesh.castShadow = true;
-  mesh.receiveShadow = true;
-  mesh.position.set(x, y, z);
-  mesh.userData = { type: type };
-
-  // Add physics collider for this block
-  const rigidBodyDesc = RAPIER.RigidBodyDesc.fixed().setTranslation(x, y, z);
-  const rigidBody = world.createRigidBody(rigidBodyDesc);
-  const colliderDesc = RAPIER.ColliderDesc.cuboid(0.5, 0.5, 0.5); // Half-extents
-  const collider = world.createCollider(colliderDesc, rigidBody);
-  mesh.userData.rigidBody = rigidBody;
-
-  // Add wireframe to make blocks distinguishable
-  const edges = new THREE.EdgesGeometry(blockGeometry);
-  const line = new THREE.LineSegments(
-    edges,
-    new THREE.LineBasicMaterial({
-      color: 0x000000,
-      opacity: 0.1,
-      transparent: true,
-    }),
-  );
-  mesh.add(line);
-
-  scene.add(mesh);
-  objects.push(mesh);
-  blockMap.set(`${x},${y},${z}`, mesh);
-  return mesh;
-}
-
-function removeBlock(mesh) {
-  if (mesh.userData.rigidBody) {
-    world.removeRigidBody(mesh.userData.rigidBody);
-  }
-  const pos = mesh.position;
-  blockMap.delete(`${pos.x},${pos.y},${pos.z}`);
-  scene.remove(mesh);
-  const index = objects.indexOf(mesh);
-  if (index > -1) {
-    objects.splice(index, 1);
-  }
-}
-
-function clearWorld() {
-  // Clear out map backwards to avoid splicing issues
-  while (objects.length > 0) {
-    removeBlock(objects[0]);
-  }
-  blockMap.clear();
-
-  // Reset player to origin
-  playerBody.setTranslation(new RAPIER.Vector3(0, 5, 0), true);
-  velocity.set(0, 0, 0);
-}
-
-function performInteract(actionName) {
-  if (!controls.isLocked) return;
-
-  raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
-  const intersects = raycaster.intersectObjects(objects, false);
-
-  if (intersects.length > 0) {
-    const intersect = intersects[0];
-    if (intersect.distance > 5) return;
-
-    if (actionName === "breakBlock") {
-      if (intersect.object.position.y > -2) {
-        const type = intersect.object.userData.type;
-        removeBlock(intersect.object);
-
-        let added = false;
-        // First pass: look for an existing stack of the same type that is not full
-        for (let i = 0; i < 36; i++) {
-          if (
-            inventory[i] &&
-            inventory[i].type === type &&
-            inventory[i].count < 64
-          ) {
-            inventory[i].count++;
-            added = true;
-            break;
-          }
-        }
-
-        // Second pass: if we couldn't stack it, find the first empty slot
-        if (!added) {
-          for (let i = 0; i < 36; i++) {
-            if (!inventory[i]) {
-              inventory[i] = { type: type, count: 1 };
-              break;
-            }
-          }
-        }
-
-        renderInventory();
-      }
-    } else if (actionName === "placeBlock") {
-      const item = inventory[hotbarSelected];
-      if (item && item.count > 0) {
-        const voxelPos = new THREE.Vector3()
-          .copy(intersect.object.position)
-          .add(intersect.face.normal);
-        addBlock(
-          Math.round(voxelPos.x),
-          Math.round(voxelPos.y),
-          Math.round(voxelPos.z),
-          item.type,
-        );
-        item.count--;
-        if (item.count === 0) inventory[hotbarSelected] = null;
-        renderInventory();
-      }
-    }
-  }
-}
-
-// --- Input Handling ---
+// --- Input ---
 function onInputDown(inputStr) {
-  switch (inputStr) {
-    case keyBinds.forward:
-      moveForward = true;
-      break;
-    case keyBinds.left:
-      moveLeft = true;
-      break;
-    case keyBinds.backward:
-      moveBackward = true;
-      break;
-    case keyBinds.right:
-      moveRight = true;
-      break;
-    case keyBinds.jump:
-      if (canJump === true) velocity.y += 15; // Jump strength
-      canJump = false;
-      break;
-    case keyBinds.breakBlock:
-      performInteract("breakBlock");
-      break;
-    case keyBinds.placeBlock:
-      performInteract("placeBlock");
-      break;
-    case keyBinds.inventory:
-      toggleInventory();
-      break;
-    case keyBinds.slot1:
-      selectHotbarSlot(0);
-      break;
-    case keyBinds.slot2:
-      selectHotbarSlot(1);
-      break;
-    case keyBinds.slot3:
-      selectHotbarSlot(2);
-      break;
-    case keyBinds.slot4:
-      selectHotbarSlot(3);
-      break;
-    case keyBinds.slot5:
-      selectHotbarSlot(4);
-      break;
-    case keyBinds.slot6:
-      selectHotbarSlot(5);
-      break;
-    case keyBinds.slot7:
-      selectHotbarSlot(6);
-      break;
-    case keyBinds.slot8:
-      selectHotbarSlot(7);
-      break;
-    case keyBinds.slot9:
-      selectHotbarSlot(8);
-      break;
+  switch(inputStr) {
+    case keyBinds.forward:    moveForward=true; break;
+    case keyBinds.left:       moveLeft=true; break;
+    case keyBinds.backward:   moveBackward=true; break;
+    case keyBinds.right:      moveRight=true; break;
+    case keyBinds.jump:       if(canJump){ velocity.y+=15; canJump=false; } break;
+    case keyBinds.breakBlock: performInteract("breakBlock"); break;
+    case keyBinds.placeBlock: performInteract("placeBlock"); break;
+    case keyBinds.inventory:  toggleInventory(); break;
+    case keyBinds.slot1: selectHotbarSlot(0); break;
+    case keyBinds.slot2: selectHotbarSlot(1); break;
+    case keyBinds.slot3: selectHotbarSlot(2); break;
+    case keyBinds.slot4: selectHotbarSlot(3); break;
+    case keyBinds.slot5: selectHotbarSlot(4); break;
+    case keyBinds.slot6: selectHotbarSlot(5); break;
+    case keyBinds.slot7: selectHotbarSlot(6); break;
+    case keyBinds.slot8: selectHotbarSlot(7); break;
+    case keyBinds.slot9: selectHotbarSlot(8); break;
+  }
+}
+function onInputUp(inputStr) {
+  switch(inputStr) {
+    case keyBinds.forward:  moveForward=false; break;
+    case keyBinds.left:     moveLeft=false; break;
+    case keyBinds.backward: moveBackward=false; break;
+    case keyBinds.right:    moveRight=false; break;
   }
 }
 
@@ -694,246 +654,246 @@ function toggleInventory() {
   isInventoryOpen = !isInventoryOpen;
   const invScreen = document.getElementById("inventory-screen");
   const blocker = document.getElementById("blocker");
-
   if (isInventoryOpen) {
     controls.unlock();
     invScreen.style.display = "block";
     blocker.style.display = "block";
-    document.getElementById("menu-main").style.display = "none"; // Ensure pause menu is hidden
+    document.getElementById("menu-main").style.display = "none";
   } else {
     invScreen.style.display = "none";
     controls.lock();
   }
 }
 
-function onInputUp(inputStr) {
-  switch (inputStr) {
-    case keyBinds.forward:
-      moveForward = false;
-      break;
-    case keyBinds.left:
-      moveLeft = false;
-      break;
-    case keyBinds.backward:
-      moveBackward = false;
-      break;
-    case keyBinds.right:
-      moveRight = false;
-      break;
-  }
-}
+function selectHotbarSlot(i) { hotbarSelected=i; renderInventory(); }
 
-function selectHotbarSlot(index) {
-  hotbarSelected = index;
-  renderInventory();
-}
+let selectedInventorySlot = null;
 
-let selectedInventorySlot = null; // Used for moving items around in inventory
-
-function renderInventory() {
-  // 1. Render always-visible bottom hotbar UI
+function updateHotbarDisplay() {
   const hotbarDiv = document.getElementById("hotbar");
   const nameDiv = document.getElementById("hotbar-name");
   hotbarDiv.innerHTML = "";
-
-  for (let i = 0; i < 9; i++) {
+  for (let i=0;i<9;i++) {
     const item = inventory[i];
     const slot = document.createElement("div");
-    slot.className = `slot ${i === hotbarSelected ? "active" : ""}`;
+    slot.className = `slot ${i===hotbarSelected?"active":""}`;
     if (item) {
       slot.style.backgroundImage = `url(${iconUris[item.type]})`;
-      const countStr = document.createElement("div");
-      countStr.className = "slot-count";
-      countStr.innerText = item.count;
-      slot.appendChild(countStr);
-      if (i === hotbarSelected) nameDiv.innerText = item.type.toUpperCase();
-    } else if (i === hotbarSelected) {
-      nameDiv.innerText = "";
-    }
+      const c = document.createElement("div");
+      c.className="slot-count"; c.innerText=item.count;
+      slot.appendChild(c);
+      if (i===hotbarSelected) nameDiv.innerText=item.type.toUpperCase();
+    } else if (i===hotbarSelected) nameDiv.innerText="";
     hotbarDiv.appendChild(slot);
   }
+}
 
-  // 2. Render Full Inventory Screen if open
-  if (isInventoryOpen || true) {
-    const invGrid = document.getElementById("inventory-grid");
-    const invHotbarGrid = document.getElementById("inventory-hotbar-grid");
-    invGrid.innerHTML = "";
-    invHotbarGrid.innerHTML = "";
+function renderInventoryScreen() {
+  if (!isInventoryOpen) return;
+  const invGrid = document.getElementById("inventory-grid");
+  const invHotbarGrid = document.getElementById("inventory-hotbar-grid");
+  invGrid.innerHTML=""; invHotbarGrid.innerHTML="";
 
-    const setupClick = (slotDiv, index) => {
-      slotDiv.addEventListener("click", () => {
-        if (selectedInventorySlot === null) {
-          selectedInventorySlot = index; // Pick up
-          renderInventory();
-        } else {
-          // Swap
-          const temp = inventory[index];
-          inventory[index] = inventory[selectedInventorySlot];
-          inventory[selectedInventorySlot] = temp;
-          selectedInventorySlot = null; // Drop
-          renderInventory();
-        }
-      });
-    };
-
-    // Render main 27 slots (indices 9 to 35)
-    for (let i = 9; i < 36; i++) {
-      const item = inventory[i];
-      const slot = document.createElement("div");
-      slot.className = `inv-slot ${selectedInventorySlot === i ? "active" : ""}`;
-      if (item) {
-        slot.style.backgroundImage = `url(${iconUris[item.type]})`;
-        const countStr = document.createElement("div");
-        countStr.className = "inv-slot-count";
-        countStr.innerText = item.count;
-        slot.appendChild(countStr);
-      }
-      setupClick(slot, i);
-      invGrid.appendChild(slot);
+  const makeSlot = (i) => {
+    const item = inventory[i];
+    const slot = document.createElement("div");
+    slot.className = `inv-slot ${selectedInventorySlot===i?"active":""}`;
+    if (item) {
+      slot.style.backgroundImage=`url(${iconUris[item.type]})`;
+      const c=document.createElement("div"); c.className="inv-slot-count"; c.innerText=item.count;
+      slot.appendChild(c);
     }
+    slot.addEventListener("click", ()=>{
+      if (selectedInventorySlot===null) { selectedInventorySlot=i; }
+      else { const t=inventory[i]; inventory[i]=inventory[selectedInventorySlot]; inventory[selectedInventorySlot]=t; selectedInventorySlot=null; }
+      updateHotbarDisplay(); renderInventoryScreen();
+    });
+    return slot;
+  };
+  for (let i=9;i<36;i++) invGrid.appendChild(makeSlot(i));
+  for (let i=0;i<9;i++) invHotbarGrid.appendChild(makeSlot(i));
+}
 
-    // Render hotbar 9 slots in inventory screen (indices 0 to 8)
-    for (let i = 0; i < 9; i++) {
-      const item = inventory[i];
-      const slot = document.createElement("div");
-      slot.className = `inv-slot ${selectedInventorySlot === i ? "active" : ""}`;
-      if (item) {
-        slot.style.backgroundImage = `url(${iconUris[item.type]})`;
-        const countStr = document.createElement("div");
-        countStr.className = "inv-slot-count";
-        countStr.innerText = item.count;
-        slot.appendChild(countStr);
+function renderInventory() {
+  const now = performance.now();
+  if (now - lastInventoryUpdate < INVENTORY_UPDATE_THROTTLE) return;
+  lastInventoryUpdate = now;
+  updateHotbarDisplay();
+  if (isInventoryOpen) renderInventoryScreen();
+}
+
+// --- Interaction ---
+function performInteract(actionName) {
+  if (!controls.isLocked) return;
+  raycaster.setFromCamera(_screenCenter, camera);
+  const intersects = raycaster.intersectObjects(visibleObjects, false);
+  if (!intersects.length || intersects[0].distance > 5) return;
+
+  const intersect = intersects[0];
+  const nx = intersect.face.normal.x;
+  const ny = intersect.face.normal.y;
+  const nz = intersect.face.normal.z;
+
+  if (actionName === "breakBlock") {
+    // Move hit point slightly inward (against face normal) to land inside the block.
+    const bx = Math.round(intersect.point.x - nx * 0.5);
+    const by = Math.round(intersect.point.y - ny * 0.5);
+    const bz = Math.round(intersect.point.z - nz * 0.5);
+    const posKey = `${bx},${by},${bz}`;
+    const blockType = blockMap.get(posKey);
+    if (blockType) {
+      // Don't break below y = -2 (bedrock floor)
+      if (by <= -2) return;
+      removeBlock(posKey);
+      // Add to inventory
+      let added = false;
+      for (let i=0;i<36;i++) {
+        if (inventory[i]?.type===blockType && inventory[i].count<64) { inventory[i].count++; added=true; break; }
       }
-      setupClick(slot, i);
-      invHotbarGrid.appendChild(slot);
+      if (!added) for (let i=0;i<36;i++) { if(!inventory[i]){ inventory[i]={type:blockType,count:1}; break; } }
+      renderInventory();
     }
+  } else if (actionName === "placeBlock") {
+    const item = inventory[hotbarSelected];
+    if (!item || item.count <= 0) return;
+    const px = Math.round(intersect.point.x + nx * 0.5);
+    const py = Math.round(intersect.point.y + ny * 0.5);
+    const pz = Math.round(intersect.point.z + nz * 0.5);
+    addBlock(px, py, pz, item.type);
+    item.count--;
+    if (item.count===0) inventory[hotbarSelected]=null;
+    renderInventory();
   }
 }
 
-// Ensure context menu doesn't appear on right click
-document.addEventListener("contextmenu", (event) => event.preventDefault());
+// --- Main Loop ---
+let lastCullingUpdate = 0;
+const CULLING_UPDATE_INTERVAL = 500;
+let lastRaycasterUpdate = 0;
+const RAYCASTER_UPDATE_INTERVAL = 50; // 20fps for highlight is plenty
+let lastSkyUpdate = 0;
+const SKY_UPDATE_INTERVAL = 100;
 
-function onWindowResize() {
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-}
-
-// --- Main Loop & Physics ---
 function animate() {
   requestAnimationFrame(animate);
-
   const time = performance.now();
+
+  // Flush any dirty chunk rebuilds (from block place/break)
+  flushDirtyChunks();
+
+  // Day/Night cycle
   const rawDelta = (time - prevTime) / 1000;
-  
-  // Day/Night Cycle (1 full day every 2 minutes = 120 seconds -> 2*PI/120 speed)
+  const frameMs = rawDelta * 1000;
+  smoothedFrameMs = smoothedFrameMs * 0.9 + frameMs * 0.1;
   timeOfDay += rawDelta * (Math.PI * 2 / 120);
   if (timeOfDay > Math.PI * 2) timeOfDay -= Math.PI * 2;
-  
-  // Update sunlight string
-  const sunX = Math.cos(timeOfDay) * 100;
-  const sunY = Math.sin(timeOfDay) * 100;
-  const sunZ = Math.sin(timeOfDay) * 40; // slight angle
-  
-  directionalLight.position.set(sunX, sunY, sunZ);
-  
-  // If sun is below horizon, diminish its intensity and color
-  let intensity = Math.max(0, Math.sin(timeOfDay));
-  directionalLight.intensity = intensity * 1.5;
-  
-  // Sky color changes
-  if (intensity > 0) {
-      scene.background.setHSL(0.55, 0.5, 0.5 + intensity * 0.3);
-      scene.fog.color.copy(scene.background);
-      ambientLight.intensity = 0.2 + intensity * 0.4;
-  } else {
-      scene.background.setHex(0x050515); // Night sky
-      scene.fog.color.copy(scene.background);
-      ambientLight.intensity = 0.1;
+
+  // Adaptive internal resolution: lower pixel ratio on sustained spikes, restore when stable.
+  if (time - lastDprEval > 1000) {
+    if (smoothedFrameMs > 23) {
+      targetPixelRatio = Math.max(0.7, targetPixelRatio - 0.1);
+    } else if (smoothedFrameMs < 16) {
+      targetPixelRatio = Math.min(BASE_PIXEL_RATIO, targetPixelRatio + 0.1);
+    }
+
+    if (Math.abs(targetPixelRatio - currentPixelRatio) >= 0.05) {
+      currentPixelRatio = targetPixelRatio;
+      renderer.setPixelRatio(currentPixelRatio);
+      renderer.setSize(window.innerWidth, window.innerHeight, false);
+    }
+    lastDprEval = time;
   }
 
-  if (controls.isLocked === true) {
-    // Highlighting / RollOver update
-    raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
-    const intersects = raycaster.intersectObjects(objects, false);
-
-    if (intersects.length > 0 && intersects[0].distance <= 5) {
-      const intersect = intersects[0];
-      const voxelPos = new THREE.Vector3()
-        .copy(intersect.object.position)
-        .add(intersect.face.normal);
-      rollOverMesh.position.copy(voxelPos);
-      rollOverMesh.visible = true;
+  if (time - lastSkyUpdate > SKY_UPDATE_INTERVAL) {
+    const sinTime = Math.sin(timeOfDay);
+    const cosTime = Math.cos(timeOfDay);
+    directionalLight.position.set(cosTime*100, sinTime*100, sinTime*40);
+    const intensity = Math.max(0, sinTime);
+    directionalLight.intensity = intensity * 1.5;
+    if (intensity > 0) {
+      scene.background.setHSL(0.55, 0.5, 0.5 + intensity*0.3);
+      scene.fog.color.copy(scene.background);
+      ambientLight.intensity = 0.2 + intensity*0.4;
     } else {
-      rollOverMesh.visible = false;
+      scene.background.setHex(0x050515);
+      scene.fog.color.copy(scene.background);
+      ambientLight.intensity = 0.1;
+    }
+    lastSkyUpdate = time;
+  }
+
+  // Update shadow map only every 2 seconds
+  if (!animate._lastShadow || time - animate._lastShadow > 2000) {
+    renderer.shadowMap.needsUpdate = true;
+    animate._lastShadow = time;
+  }
+
+  // Periodic physics + visible list update
+  if (time - lastCullingUpdate > CULLING_UPDATE_INTERVAL) {
+    updatePhysicsBodies(camera.position);
+
+    const playerChunkX = Math.floor(camera.position.x / CHUNK_SIZE);
+    const playerChunkZ = Math.floor(camera.position.z / CHUNK_SIZE);
+    const movedChunk = playerChunkX !== lastPlayerChunkX || playerChunkZ !== lastPlayerChunkZ;
+    if (needsVisibleRebuild || movedChunk) {
+      rebuildVisibleObjects();
+      needsVisibleRebuild = false;
+      lastPlayerChunkX = playerChunkX;
+      lastPlayerChunkZ = playerChunkZ;
     }
 
-    // Movement Physics
-    const delta = Math.min((time - prevTime) / 1000, 0.1); // Cap delta to prevent huge jumps
+    lastCullingUpdate = time;
+  }
 
+  if (controls.isLocked) {
+    // Block highlight
+    if (time - lastRaycasterUpdate > RAYCASTER_UPDATE_INTERVAL) {
+      raycaster.setFromCamera(_screenCenter, camera);
+      const hits = raycaster.intersectObjects(visibleObjects, false);
+      if (hits.length && hits[0].distance <= 5) {
+        const hit = hits[0];
+        rollOverMesh.position.set(
+          Math.round(hit.point.x - hit.face.normal.x * 0.5),
+          Math.round(hit.point.y - hit.face.normal.y * 0.5),
+          Math.round(hit.point.z - hit.face.normal.z * 0.5)
+        );
+        rollOverMesh.visible = true;
+      } else {
+        rollOverMesh.visible = false;
+      }
+      lastRaycasterUpdate = time;
+    }
+
+    const delta = Math.min(rawDelta, 0.1);
     velocity.x -= velocity.x * 10.0 * delta;
     velocity.z -= velocity.z * 10.0 * delta;
+    velocity.y -= 30 * delta;
 
-    // Apply jump velocity manually since we use kinematic character controller
-    velocity.y -= 30 * delta; // Gravity
+    _right.setFromMatrixColumn(camera.matrix, 0);
+    _right.y = 0; _right.normalize();
+    _front.crossVectors(_up, _right).normalize();
+    _moveVec.set(0,0,0);
+    if (moveForward)  _moveVec.add(_front);
+    if (moveBackward) _moveVec.sub(_front);
+    if (moveLeft)     _moveVec.sub(_right);
+    if (moveRight)    _moveVec.add(_right);
+    if (_moveVec.lengthSq() > 0) _moveVec.normalize().multiplyScalar(10 * delta);
 
-    const speed = 10.0; // Movement speed
+    _rapierMovement.x = _moveVec.x;
+    _rapierMovement.y = velocity.y * delta;
+    _rapierMovement.z = _moveVec.z;
 
-    // When Pitching up/down, camera's local X-axis (Right) is unaffected.
-    // We use it to reliably extract horizontal Forward and Right vectors regardless of Gimbal lock.
-    const right = new THREE.Vector3();
-    right.setFromMatrixColumn(camera.matrix, 0);
-    right.y = 0;
-    right.normalize();
+    characterController.computeColliderMovement(playerCollider, _rapierMovement);
+    const cm = characterController.computedMovement();
+    if (characterController.computedGrounded()) { canJump=true; if(velocity.y<0) velocity.y=0; }
 
-    const front = new THREE.Vector3();
-    front.crossVectors(new THREE.Vector3(0, 1, 0), right).normalize();
-
-    const moveVec = new THREE.Vector3();
-    if (moveForward) moveVec.add(front);
-    if (moveBackward) moveVec.sub(front);
-    if (moveLeft) moveVec.sub(right);
-    if (moveRight) moveVec.add(right);
-
-    // Normalize so diagonal movement isn't faster, then apply speed
-    if (moveVec.lengthSq() > 0) {
-      moveVec.normalize().multiplyScalar(speed * delta);
-    }
-
-    // Compute desired movement including gravity/jump
-    const desiredMovement = new RAPIER.Vector3(
-      moveVec.x,
-      velocity.y * delta,
-      moveVec.z,
-    );
-
-    // Compute colliding movement
-    characterController.computeColliderMovement(
-      playerCollider,
-      desiredMovement,
-    );
-
-    const computedMovement = characterController.computedMovement();
-
-    // Correct velocity based on actual movement (e.g. hitting ground stops falling)
-    if (characterController.computedGrounded()) {
-      canJump = true;
-      if (velocity.y < 0) velocity.y = 0;
-    }
-
-    // Apply computed movement to player body and camera
-    const nextPos = playerBody.translation();
-    nextPos.x += computedMovement.x;
-    nextPos.y += computedMovement.y;
-    nextPos.z += computedMovement.z;
-    playerBody.setNextKinematicTranslation(nextPos);
-
-    // Step simulation
+    const np = playerBody.translation();
+    np.x+=cm.x; np.y+=cm.y; np.z+=cm.z;
+    playerBody.setNextKinematicTranslation(np);
     world.step();
 
-    // Update camera position to match physics body
     const pos = playerBody.translation();
-    controls.getObject().position.set(pos.x, pos.y + 0.8, pos.z); // Adjust camera height above capsule center
+    controls.getObject().position.set(pos.x, pos.y+0.8, pos.z);
   }
 
   prevTime = time;

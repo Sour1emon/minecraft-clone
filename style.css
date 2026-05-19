@@ -5,6 +5,7 @@ body {
     user-select: none;
     -webkit-user-select: none;
     background-color: #87CEEB; /* Sky blue */
+    will-change: background-color;
 }
 
 #ui-layer {
@@ -65,11 +66,13 @@ body {
     background-size: cover;
     background-position: center;
     image-rendering: pixelated;
+    will-change: transform, box-shadow;
+    transform: translate3d(0, 0, 0); /* Enable GPU acceleration */
 }
 
 .slot.active {
     border: 3px solid white;
-    transform: scale(1.05);
+    transform: scale3d(1.05, 1.05, 1);
     box-shadow: 0px 0px 10px rgba(255,255,255,0.5);
     z-index: 5;
 }
@@ -94,6 +97,8 @@ body {
     align-items: center;
     pointer-events: auto; /* Catch clicks for pointer lock */
     z-index: 10;
+    will-change: display;
+    backface-visibility: hidden;
 }
 
 #pause-screen-layer {
