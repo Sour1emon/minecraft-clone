@@ -41,16 +41,112 @@ let prevTime = performance.now();
 const velocity = new THREE.Vector3();
 const direction = new THREE.Vector3();
 
-// Block Types & Materials
-const textureLoader = new THREE.TextureLoader();
-// Using simple colors for now instead of textures for immediate preview without CORS issues
+// --- Texture Generation ---
+function generateTexture(type) {
+    const canvas = document.createElement('canvas');
+    canvas.width = 16;
+    canvas.height = 16;
+    const ctx = canvas.getContext('2d');
+    
+    const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+    
+    // Base colors
+    let baseColor, noiseColors;
+    if (type === 'dirt') {
+        baseColor = [139, 69, 19];
+        noiseColors = [[107, 52, 16], [155, 86, 32]];
+    } else if (type === 'stone') {
+        baseColor = [128, 128, 128];
+        noiseColors = [[100, 100, 100], [150, 150, 150]];
+    } else if (type === 'grass_top') {
+        baseColor = [85, 170, 85];
+        noiseColors = [[68, 153, 68], [102, 187, 102]];
+    } else if (type === 'wood_top') {
+        baseColor = [139, 90, 43];
+        noiseColors = [[120, 75, 35], [150, 100, 50]];
+    }
+    
+    if (type === 'grass_side') {
+        for (let y = 0; y < 16; y++) {
+            for (let x = 0; x < 16; x++) {
+                // Top a few pixels green, bottom dirt
+                let isGrass = y < 4 || (y < 6 && Math.random() > 0.5);
+                let c;
+                if (isGrass) {
+                    c = Math.random() > 0.5 ? [85, 170, 85] : [68, 153, 68];
+                } else {
+                    c = Math.random() > 0.5 ? [139, 69, 19] : [107, 52, 16];
+                }
+                ctx.fillStyle = `rgb(${c[0]},${c[1]},${c[2]})`;
+                ctx.fillRect(x, y, 1, 1);
+            }
+        }
+    } else if (type === 'wood_side') {
+        for (let y = 0; y < 16; y++) {
+            for (let x = 0; x < 16; x++) {
+                let stripe = (x + Math.floor(Math.random()*1.5)) % 4;
+                let c = stripe < 2 ? [107, 66, 38] : [74, 46, 27];
+                ctx.fillStyle = `rgb(${c[0]},${c[1]},${c[2]})`;
+                ctx.fillRect(x, y, 1, 1);
+            }
+        }
+    } else if (type === 'leaves') {
+        ctx.fillStyle = `rgb(34, 139, 34)`;
+        ctx.fillRect(0, 0, 16, 16);
+        for (let i = 0; i < 150; i++) {
+            let x = rand(0, 15);
+            let y = rand(0, 15);
+            let p = Math.random();
+            if (p < 0.4) {
+                ctx.clearRect(x, y, 1, 1);
+            } else {
+                ctx.fillStyle = p < 0.7 ? 'rgb(17,119,17)' : 'rgb(50,170,50)';
+                ctx.fillRect(x, y, 1, 1);
+            }
+        }
+    } else {
+        // Standard noise fill
+        ctx.fillStyle = `rgb(${baseColor[0]},${baseColor[1]},${baseColor[2]})`;
+        ctx.fillRect(0, 0, 16, 16);
+        for (let i = 0; i < 150; i++) {
+            let x = rand(0, 15);
+            let y = rand(0, 15);
+            let nc = noiseColors[rand(0, 1)];
+            ctx.fillStyle = `rgb(${nc[0]},${nc[1]},${nc[2]})`;
+            ctx.fillRect(x, y, 1, 1);
+        }
+    }
+    
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.magFilter = THREE.NearestFilter; // Minecraft pixelated look
+    texture.minFilter = THREE.NearestFilter;
+    texture.colorSpace = THREE.SRGBColorSpace;
+    return texture;
+}
+
+const getMat = (type, trans=false) => new THREE.MeshLambertMaterial({ 
+    map: generateTexture(type),
+    transparent: trans,
+    alphaTest: trans ? 0.1 : 0
+});
+
+const texDirt = getMat('dirt');
+const texGrassTop = getMat('grass_top');
+const texGrassSide = getMat('grass_side');
+const texStone = getMat('stone');
+const texWoodTop = getMat('wood_top');
+const texWoodSide = getMat('wood_side');
+const texLeaves = getMat('leaves', true);
+
+// BoxGeometry faces: right, left, top, bottom, front, back
 const materials = {
-    'grass': new THREE.MeshLambertMaterial({ color: 0x55aa55 }),
-    'dirt': new THREE.MeshLambertMaterial({ color: 0x8B4513 }),
-    'stone': new THREE.MeshLambertMaterial({ color: 0x808080 }),
-    'wood': new THREE.MeshLambertMaterial({ color: 0x8b5a2b }),
-    'leaves': new THREE.MeshLambertMaterial({ color: 0x228b22 })
+    'grass': [texGrassSide, texGrassSide, texGrassTop, texDirt, texGrassSide, texGrassSide],
+    'dirt': texDirt,
+    'stone': texStone,
+    'wood': [texWoodSide, texWoodSide, texWoodTop, texWoodTop, texWoodSide, texWoodSide],
+    'leaves': texLeaves
 };
+
 const blockTypes = ['grass', 'dirt', 'stone', 'wood', 'leaves'];
 let currentMaterialType = 'grass';
 
