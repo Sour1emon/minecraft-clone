@@ -18,6 +18,25 @@ let moveLeft = false;
 let moveRight = false;
 let canJump = false;
 
+let renderDistance = 50;
+let isRebinding = false; // Flag to stop other key interactions while waiting for a key press
+
+// Keybind settings mapping action to actual event.code or mouse button
+const keyBinds = {
+    forward: 'KeyW',
+    backward: 'KeyS',
+    left: 'KeyA',
+    right: 'KeyD',
+    jump: 'Space',
+    breakBlock: 'Mouse0',
+    placeBlock: 'Mouse2',
+    slot1: 'Digit1',
+    slot2: 'Digit2',
+    slot3: 'Digit3',
+    slot4: 'Digit4',
+    slot5: 'Digit5'
+};
+
 let prevTime = performance.now();
 const velocity = new THREE.Vector3();
 const direction = new THREE.Vector3();
@@ -50,7 +69,7 @@ async function init() {
     // --- Scene Setup ---
     scene = new THREE.Scene();
     scene.background = new THREE.Color(0x87CEEB); // Sky blue
-    scene.fog = new THREE.Fog(0x87CEEB, 10, 50);
+    scene.fog = new THREE.Fog(0x87CEEB, 10, renderDistance);
 
     // --- Lighting ---
     const ambientLight = new THREE.AmbientLight(0xeeeeee, 0.6);
@@ -72,20 +91,93 @@ async function init() {
     controls = new PointerLockControls(camera, renderer.domElement);
     
     const blocker = document.getElementById('blocker');
-    const instructions = document.getElementById('instructions');
+    
+    // Menu panels
+    const menuMain = document.getElementById('menu-main');
+    const menuOptions = document.getElementById('menu-options');
+    const menuGraphics = document.getElementById('menu-graphics');
+    const menuControls = document.getElementById('menu-controls');
 
-    instructions.addEventListener('click', function () {
-        controls.lock();
+    // UI functions
+    function showMenu(menu) {
+        menuMain.style.display = 'none';
+        menuOptions.style.display = 'none';
+        menuGraphics.style.display = 'none';
+        menuControls.style.display = 'none';
+        menu.style.display = 'flex';
+    }
+
+    // Main pause menu
+    document.getElementById('btn-resume').addEventListener('click', () => controls.lock());
+    document.getElementById('btn-options').addEventListener('click', () => showMenu(menuOptions));
+    document.getElementById('btn-exit').addEventListener('click', () => {
+        clearWorld();
+        generateWorld();
+        controls.lock(); // Optionally restart immediately
     });
 
+    // Options menu
+    document.getElementById('btn-graphics').addEventListener('click', () => showMenu(menuGraphics));
+    document.getElementById('btn-controls').addEventListener('click', () => showMenu(menuControls));
+    document.getElementById('btn-options-done').addEventListener('click', () => showMenu(menuMain));
+
+    // Graphics Menu
+    const sliderRenderDist = document.getElementById('graphics-render-distance');
+    const lblRenderDist = document.getElementById('lbl-render-distance');
+    sliderRenderDist.addEventListener('input', (e) => {
+        renderDistance = parseInt(e.target.value);
+        lblRenderDist.innerText = `${renderDistance} chunks`;
+        scene.fog.far = renderDistance;
+    });
+    document.getElementById('btn-graphics-done').addEventListener('click', () => showMenu(menuOptions));
+
+    // Controls Menu KeyBinding Logic
+    document.querySelectorAll('.keybind-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            isRebinding = true;
+            const targetBtn = e.target;
+            const action = targetBtn.getAttribute('data-action');
+            targetBtn.innerText = '>'; // Visual cue
+            
+            const handleBindKey = (ev) => {
+                ev.preventDefault();
+                finalizeBind(ev.code, ev.code === 'Space' ? 'SPACE' : ev.code.replace('Key', ''));
+            };
+            
+            const handleBindMouse = (ev) => {
+                ev.preventDefault();
+                let name = 'Click L';
+                if (ev.button === 1) name = 'Click M';
+                if (ev.button === 2) name = 'Click R';
+                finalizeBind('Mouse' + ev.button, name);
+            };
+
+            const finalizeBind = (code, display) => {
+                keyBinds[action] = code;
+                targetBtn.innerText = display;
+                document.removeEventListener('keydown', handleBindKey);
+                document.removeEventListener('mousedown', handleBindMouse);
+                // Delay dropping the flag so the binding click itself doesn't trigger an in-game action
+                setTimeout(() => { isRebinding = false; }, 50);
+            };
+
+            // Use setTimeout so the current click doesn't trigger the mousedown listener instantly
+            setTimeout(() => {
+                document.addEventListener('keydown', handleBindKey);
+                document.addEventListener('mousedown', handleBindMouse);
+            }, 10);
+        });
+    });
+    document.getElementById('btn-controls-done').addEventListener('click', () => showMenu(menuOptions));
+
+
     controls.addEventListener('lock', function () {
-        instructions.style.display = 'none';
         blocker.style.display = 'none';
     });
 
     controls.addEventListener('unlock', function () {
         blocker.style.display = 'flex';
-        instructions.style.display = '';
+        showMenu(menuMain); // Reset back to main pause context
     });
 
     scene.add(controls.getObject());
@@ -102,18 +194,19 @@ async function init() {
     controls.getObject().position.y = 5; // Spawn height
 
     // --- Event Listeners ---
-    document.addEventListener('keydown', onKeyDown);
-    document.addEventListener('keyup', onKeyUp);
-    document.addEventListener('mousedown', onMouseDown);
-    window.addEventListener('resize', onWindowResize);
-
-    // Hotbar keys (1-5)
-    document.addEventListener('keydown', (event) => {
-        const key = parseInt(event.key);
-        if (key >= 1 && key <= 5) {
-            selectBlock(key - 1);
-        }
+    document.addEventListener('keydown', (e) => {
+        if (!isRebinding) onInputDown(e.code);
     });
+    document.addEventListener('keyup', (e) => {
+        if (!isRebinding) onInputUp(e.code);
+    });
+    document.addEventListener('mousedown', (e) => {
+        if (!isRebinding) onInputDown('Mouse' + e.button);
+    });
+    document.addEventListener('mouseup', (e) => {
+        if (!isRebinding) onInputUp('Mouse' + e.button);
+    });
+    window.addEventListener('resize', onWindowResize);
 
     // --- Raycaster & RollOver (Highlight) ---
     raycaster = new THREE.Raycaster();
@@ -180,54 +273,19 @@ function removeBlock(mesh) {
     }
 }
 
-// --- Input Handling ---
-function onKeyDown(event) {
-    switch (event.code) {
-        case 'ArrowUp':
-        case 'KeyW':
-            moveForward = true;
-            break;
-        case 'ArrowLeft':
-        case 'KeyA':
-            moveLeft = true;
-            break;
-        case 'ArrowDown':
-        case 'KeyS':
-            moveBackward = true;
-            break;
-        case 'ArrowRight':
-        case 'KeyD':
-            moveRight = true;
-            break;
-        case 'Space':
-            if (canJump === true) velocity.y += 15; // Jump strength
-            canJump = false;
-            break;
+function clearWorld() {
+    // Clear out map backwards to avoid splicing issues
+    while (objects.length > 0) {
+        removeBlock(objects[0]);
     }
+    blockMap.clear();
+    
+    // Reset player to origin
+    playerBody.setTranslation(new RAPIER.Vector3(0, 5, 0), true);
+    velocity.set(0,0,0);
 }
 
-function onKeyUp(event) {
-    switch (event.code) {
-        case 'ArrowUp':
-        case 'KeyW':
-            moveForward = false;
-            break;
-        case 'ArrowLeft':
-        case 'KeyA':
-            moveLeft = false;
-            break;
-        case 'ArrowDown':
-        case 'KeyS':
-            moveBackward = false;
-            break;
-        case 'ArrowRight':
-        case 'KeyD':
-            moveRight = false;
-            break;
-    }
-}
-
-function onMouseDown(event) {
+function performInteract(actionName) {
     if (!controls.isLocked) return;
 
     // Use center of screen for raycasting with pointer lock
@@ -240,19 +298,77 @@ function onMouseDown(event) {
         // Prevent interaction if it's too far (reach is ~5 blocks)
         if (intersect.distance > 5) return;
 
-        // Left Click (Break)
-        if (event.button === 0) {
+        if (actionName === 'breakBlock') {
             // Don't break bedrock/bottom layer for safety
             if (intersect.object.position.y > -2) {
                 removeBlock(intersect.object);
             }
         } 
-        // Right Click (Place)
-        else if (event.button === 2) {
+        else if (actionName === 'placeBlock') {
             const voxelPos = new THREE.Vector3().copy(intersect.object.position).add(intersect.face.normal);
             // Optional: Check if player intersects with the new block position before placing
             addBlock(Math.round(voxelPos.x), Math.round(voxelPos.y), Math.round(voxelPos.z), currentMaterialType);
         }
+    }
+}
+
+// --- Input Handling ---
+function onInputDown(inputStr) {
+    switch (inputStr) {
+        case keyBinds.forward:
+            moveForward = true;
+            break;
+        case keyBinds.left:
+            moveLeft = true;
+            break;
+        case keyBinds.backward:
+            moveBackward = true;
+            break;
+        case keyBinds.right:
+            moveRight = true;
+            break;
+        case keyBinds.jump:
+            if (canJump === true) velocity.y += 15; // Jump strength
+            canJump = false;
+            break;
+        case keyBinds.breakBlock:
+            performInteract('breakBlock');
+            break;
+        case keyBinds.placeBlock:
+            performInteract('placeBlock');
+            break;
+        case keyBinds.slot1:
+            selectBlock(0);
+            break;
+        case keyBinds.slot2:
+            selectBlock(1);
+            break;
+        case keyBinds.slot3:
+            selectBlock(2);
+            break;
+        case keyBinds.slot4:
+            selectBlock(3);
+            break;
+        case keyBinds.slot5:
+            selectBlock(4);
+            break;
+    }
+}
+
+function onInputUp(inputStr) {
+    switch (inputStr) {
+        case keyBinds.forward:
+            moveForward = false;
+            break;
+        case keyBinds.left:
+            moveLeft = false;
+            break;
+        case keyBinds.backward:
+            moveBackward = false;
+            break;
+        case keyBinds.right:
+            moveRight = false;
+            break;
     }
 }
 
@@ -304,20 +420,27 @@ function animate() {
         // Apply jump velocity manually since we use kinematic character controller
         velocity.y -= 30 * delta; // Gravity
 
-        direction.z = Number(moveForward) - Number(moveBackward);
-        direction.x = Number(moveRight) - Number(moveLeft);
-        direction.normalize();
-
         const speed = 10.0; // Movement speed
         
-        // Desired horizontal movement calculated from direction relative to camera
+        // Calculate forward and right vectors based on where the camera is facing
+        const front = new THREE.Vector3();
+        controls.getDirection(front);
+        front.y = 0; // Keep movement purely horizontal
+        front.normalize();
+
+        const right = new THREE.Vector3();
+        right.crossVectors(front, new THREE.Vector3(0, 1, 0)).normalize();
+
         const moveVec = new THREE.Vector3();
-        if (moveForward || moveBackward) moveVec.z = -direction.z * speed * delta;
-        if (moveLeft || moveRight) moveVec.x = -direction.x * speed * delta;
-        
-        // Rotate move vector by camera's Y rotation
-        const euler = new THREE.Euler(0, camera.rotation.y, 0, 'YXZ');
-        moveVec.applyEuler(euler);
+        if (moveForward) moveVec.add(front);
+        if (moveBackward) moveVec.sub(front);
+        if (moveLeft) moveVec.sub(right);
+        if (moveRight) moveVec.add(right);
+
+        // Normalize so diagonal movement isn't faster, then apply speed
+        if (moveVec.lengthSq() > 0) {
+            moveVec.normalize().multiplyScalar(speed * delta);
+        }
 
         // Compute desired movement including gravity/jump
         const desiredMovement = new RAPIER.Vector3(

@@ -72,16 +72,73 @@ body {
     z-index: 10;
 }
 
-#instructions {
-    text-align: center;
-    color: white;
-    cursor: pointer;
-    background: rgba(0,0,0,0.5);
-    padding: 2rem 4rem;
-    border-radius: 10px;
-    border: 2px solid rgba(255,255,255,0.2);
+#pause-screen-layer {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    justify-content: center;
+    align-items: center;
 }
 
-#instructions p {
-    line-height: 1.6;
+.menu-container {
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    width: 400px;
+}
+
+.menu-container h1 {
+    color: white;
+    text-shadow: 2px 2px 0 #000;
+    margin-bottom: 20px;
+    font-size: 24px;
+}
+
+.mc-button {
+    width: 300px;
+    height: 40px;
+    background-color: #7d7d7d;
+    border: 2px solid;
+    border-top-color: #bebebe;
+    border-left-color: #bebebe;
+    border-right-color: #4b4b4b;
+    border-bottom-color: #4b4b4b;
+    color: white;
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 16px;
+    font-weight: bold;
+    text-shadow: 1px 1px 0 #000;
+    cursor: pointer;
+    box-sizing: border-box;
+}
+
+.mc-button:hover {
+    background-color: #8c90cc;
+    border-top-color: #c9caef;
+    border-left-color: #c9caef;
+    border-right-color: #535691;
+    border-bottom-color: #535691;
+}
+
+.mc-button:active {
+    border-top-color: #4b4b4b;
+    border-left-color: #4b4b4b;
+    border-right-color: #bebebe;
+    border-bottom-color: #bebebe;
+}
+
+.sm-button {
+    width: 120px;
+}
+
+.keybind-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    width: 300px;
+    color: white;
+    text-shadow: 1px 1px 0 #000;
+    margin-bottom: 4px;
 }
