@@ -28,6 +28,7 @@ const keyBinds = {
     left: 'KeyA',
     right: 'KeyD',
     jump: 'Space',
+    inventory: 'KeyE',
     breakBlock: 'Mouse0',
     placeBlock: 'Mouse2',
     slot1: 'Digit1',
@@ -42,6 +43,8 @@ const velocity = new THREE.Vector3();
 const direction = new THREE.Vector3();
 
 // --- Texture Generation ---
+const iconUris = {}; // Map block type to base64 image URI for HTML UI
+
 function generateTexture(type) {
     const canvas = document.createElement('canvas');
     canvas.width = 16;
@@ -64,6 +67,35 @@ function generateTexture(type) {
     } else if (type === 'wood_top') {
         baseColor = [139, 90, 43];
         noiseColors = [[120, 75, 35], [150, 100, 50]];
+    } else if (type === 'sand') {
+        baseColor = [238, 214, 175];
+        noiseColors = [[200, 180, 140], [255, 230, 190]];
+    } else if (type === 'brick') {
+        ctx.fillStyle = '#aaa'; // Mortar base
+        ctx.fillRect(0,0,16,16);
+        ctx.fillStyle = '#b22222'; // Brick red
+        // Rows of bricks
+        for(let r=0; r<4; r++) {
+            let offset = r%2 === 0 ? 0 : -8;
+            for(let c=0; c<2; c++) {
+                ctx.fillRect(c*16 + offset, r*4, 15, 3);
+            }
+        }
+        for (let i = 0; i < 30; i++) {
+            let x = rand(0, 15), y = rand(0, 15);
+            ctx.fillStyle = `rgba(0,0,0,0.2)`;
+            ctx.fillRect(x,y,1,1);
+        }
+    } else if (type === 'glass') {
+        ctx.clearRect(0,0,16,16);
+        ctx.fillStyle = 'rgba(200,220,255,0.4)';
+        ctx.fillRect(0,0,16,16);
+        ctx.fillStyle = 'rgba(255,255,255,0.8)';
+        ctx.fillRect(0,0,16,2); // Top frame
+        ctx.fillRect(0,14,16,2); // Bottom frame
+        ctx.fillRect(0,0,2,16); // Left frame
+        ctx.fillRect(14,0,2,16); // Right frame
+        ctx.fillRect(2,2,4,4); // Glint
     }
     
     if (type === 'grass_side') {
@@ -104,7 +136,7 @@ function generateTexture(type) {
                 ctx.fillRect(x, y, 1, 1);
             }
         }
-    } else {
+    } else if (['dirt', 'stone', 'grass_top', 'wood_top', 'sand'].includes(type)) {
         // Standard noise fill
         ctx.fillStyle = `rgb(${baseColor[0]},${baseColor[1]},${baseColor[2]})`;
         ctx.fillRect(0, 0, 16, 16);
@@ -117,6 +149,8 @@ function generateTexture(type) {
         }
     }
     
+    iconUris[type] = canvas.toDataURL(); // Cache for the UI HTML rendering
+
     const texture = new THREE.CanvasTexture(canvas);
     texture.magFilter = THREE.NearestFilter; // Minecraft pixelated look
     texture.minFilter = THREE.NearestFilter;
@@ -137,6 +171,13 @@ const texStone = getMat('stone');
 const texWoodTop = getMat('wood_top');
 const texWoodSide = getMat('wood_side');
 const texLeaves = getMat('leaves', true);
+const texSand = getMat('sand');
+const texBrick = getMat('brick');
+const texGlass = getMat('glass', true);
+
+// Map complex block types to specific icons for the inventory
+iconUris['grass'] = iconUris['grass_side'];
+iconUris['wood'] = iconUris['wood_side'];
 
 // BoxGeometry faces: right, left, top, bottom, front, back
 const materials = {
@@ -144,10 +185,13 @@ const materials = {
     'dirt': texDirt,
     'stone': texStone,
     'wood': [texWoodSide, texWoodSide, texWoodTop, texWoodTop, texWoodSide, texWoodSide],
-    'leaves': texLeaves
+    'leaves': texLeaves,
+    'sand': texSand,
+    'brick': texBrick,
+    'glass': texGlass
 };
 
-const blockTypes = ['grass', 'dirt', 'stone', 'wood', 'leaves'];
+const blockTypes = ['grass', 'dirt', 'stone', 'wood', 'leaves', 'sand', 'brick', 'glass'];
 let currentMaterialType = 'grass';
 
 const blockGeometry = new THREE.BoxGeometry(1, 1, 1);
@@ -312,9 +356,27 @@ async function init() {
     rollOverMesh = new THREE.LineSegments(rollOverGeo, rollOverMaterial);
     scene.add(rollOverMesh);
 
+    // Initial UI render
+    renderInventory();
+    selectHotbarSlot(0);
+
     // --- World Generation ---
     generateWorld();
 }
+
+let inventory = Array(36).fill(null); // 0-8 is hotbar, 9-35 is main inventory
+let hotbarSelected = 0; // 0 to 8
+let isInventoryOpen = false;
+
+// Give player some starting blocks
+inventory[0] = { type: 'grass', count: 64 };
+inventory[1] = { type: 'dirt', count: 64 };
+inventory[2] = { type: 'stone', count: 64 };
+inventory[3] = { type: 'wood', count: 64 };
+inventory[4] = { type: 'leaves', count: 64 };
+inventory[5] = { type: 'sand', count: 64 };
+inventory[6] = { type: 'brick', count: 64 };
+inventory[7] = { type: 'glass', count: 64 };
 
 function generateWorld() {
     // Generate a simple 20x20 flat grid
@@ -384,26 +446,39 @@ function clearWorld() {
 function performInteract(actionName) {
     if (!controls.isLocked) return;
 
-    // Use center of screen for raycasting with pointer lock
     raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
     const intersects = raycaster.intersectObjects(objects, false);
 
     if (intersects.length > 0) {
         const intersect = intersects[0];
-        
-        // Prevent interaction if it's too far (reach is ~5 blocks)
         if (intersect.distance > 5) return;
 
         if (actionName === 'breakBlock') {
-            // Don't break bedrock/bottom layer for safety
             if (intersect.object.position.y > -2) {
+                const type = intersect.object.userData.type;
                 removeBlock(intersect.object);
+                // Add to inventory (simplistic: find first stack or empty slot)
+                for (let i = 0; i < 36; i++) {
+                    if (inventory[i] && inventory[i].type === type && inventory[i].count < 64) {
+                        inventory[i].count++;
+                        break;
+                    } else if (!inventory[i]) {
+                        inventory[i] = { type: type, count: 1 };
+                        break;
+                    }
+                }
+                renderInventory();
             }
         } 
         else if (actionName === 'placeBlock') {
-            const voxelPos = new THREE.Vector3().copy(intersect.object.position).add(intersect.face.normal);
-            // Optional: Check if player intersects with the new block position before placing
-            addBlock(Math.round(voxelPos.x), Math.round(voxelPos.y), Math.round(voxelPos.z), currentMaterialType);
+            const item = inventory[hotbarSelected];
+            if (item && item.count > 0) {
+                const voxelPos = new THREE.Vector3().copy(intersect.object.position).add(intersect.face.normal);
+                addBlock(Math.round(voxelPos.x), Math.round(voxelPos.y), Math.round(voxelPos.z), item.type);
+                item.count--;
+                if (item.count === 0) inventory[hotbarSelected] = null;
+                renderInventory();
+            }
         }
     }
 }
@@ -433,53 +508,132 @@ function onInputDown(inputStr) {
         case keyBinds.placeBlock:
             performInteract('placeBlock');
             break;
+        case keyBinds.inventory:
+            toggleInventory();
+            break;
         case keyBinds.slot1:
-            selectBlock(0);
+            selectHotbarSlot(0);
             break;
         case keyBinds.slot2:
-            selectBlock(1);
+            selectHotbarSlot(1);
             break;
         case keyBinds.slot3:
-            selectBlock(2);
+            selectHotbarSlot(2);
             break;
         case keyBinds.slot4:
-            selectBlock(3);
+            selectHotbarSlot(3);
             break;
         case keyBinds.slot5:
-            selectBlock(4);
+            selectHotbarSlot(4);
             break;
     }
 }
 
-function onInputUp(inputStr) {
-    switch (inputStr) {
-        case keyBinds.forward:
-            moveForward = false;
-            break;
-        case keyBinds.left:
-            moveLeft = false;
-            break;
-        case keyBinds.backward:
-            moveBackward = false;
-            break;
-        case keyBinds.right:
-            moveRight = false;
-            break;
+function toggleInventory() {
+    isInventoryOpen = !isInventoryOpen;
+    const invScreen = document.getElementById('inventory-screen');
+    const blocker = document.getElementById('blocker');
+    
+    if (isInventoryOpen) {
+        controls.unlock();
+        invScreen.style.display = 'block';
+        blocker.style.display = 'block';
+        document.getElementById('menu-main').style.display = 'none'; // Ensure pause menu is hidden
+    } else {
+        invScreen.style.display = 'none';
+        controls.lock();
+    }
+}
+
+function selectHotbarSlot(index) {
+    hotbarSelected = index;
+    renderInventory();
+}
+
+let selectedInventorySlot = null; // Used for moving items around in inventory
+
+function renderInventory() {
+    // 1. Render always-visible bottom hotbar UI
+    const hotbarDiv = document.getElementById('hotbar');
+    const nameDiv = document.getElementById('hotbar-name');
+    hotbarDiv.innerHTML = '';
+    
+    for (let i = 0; i < 9; i++) {
+        const item = inventory[i];
+        const slot = document.createElement('div');
+        slot.className = `slot ${i === hotbarSelected ? 'active' : ''}`;
+        if (item) {
+            slot.style.backgroundImage = `url(${iconUris[item.type]})`;
+            const countStr = document.createElement('div');
+            countStr.className = 'slot-count';
+            countStr.innerText = item.count;
+            slot.appendChild(countStr);
+            if (i === hotbarSelected) nameDiv.innerText = item.type.toUpperCase();
+        } else if (i === hotbarSelected) {
+            nameDiv.innerText = '';
+        }
+        hotbarDiv.appendChild(slot);
+    }
+
+    // 2. Render Full Inventory Screen if open
+    if (isInventoryOpen || true) {
+        const invGrid = document.getElementById('inventory-grid');
+        const invHotbarGrid = document.getElementById('inventory-hotbar-grid');
+        invGrid.innerHTML = '';
+        invHotbarGrid.innerHTML = '';
+
+        const setupClick = (slotDiv, index) => {
+            slotDiv.addEventListener('click', () => {
+                if (selectedInventorySlot === null) {
+                    selectedInventorySlot = index; // Pick up
+                    renderInventory();
+                } else {
+                    // Swap
+                    const temp = inventory[index];
+                    inventory[index] = inventory[selectedInventorySlot];
+                    inventory[selectedInventorySlot] = temp;
+                    selectedInventorySlot = null; // Drop
+                    renderInventory();
+                }
+            });
+        };
+
+        // Render main 27 slots (indices 9 to 35)
+        for (let i = 9; i < 36; i++) {
+            const item = inventory[i];
+            const slot = document.createElement('div');
+            slot.className = `inv-slot ${selectedInventorySlot === i ? 'active' : ''}`;
+            if (item) {
+                slot.style.backgroundImage = `url(${iconUris[item.type]})`;
+                const countStr = document.createElement('div');
+                countStr.className = 'inv-slot-count';
+                countStr.innerText = item.count;
+                slot.appendChild(countStr);
+            }
+            setupClick(slot, i);
+            invGrid.appendChild(slot);
+        }
+
+        // Render hotbar 9 slots in inventory screen (indices 0 to 8)
+        for (let i = 0; i < 9; i++) {
+            const item = inventory[i];
+            const slot = document.createElement('div');
+            slot.className = `inv-slot ${selectedInventorySlot === i ? 'active' : ''}`;
+            if (item) {
+                slot.style.backgroundImage = `url(${iconUris[item.type]})`;
+                const countStr = document.createElement('div');
+                countStr.className = 'inv-slot-count';
+                countStr.innerText = item.count;
+                slot.appendChild(countStr);
+            }
+            setupClick(slot, i);
+            invHotbarGrid.appendChild(slot);
+        }
     }
 }
 
 // Ensure context menu doesn't appear on right click
 document.addEventListener('contextmenu', event => event.preventDefault());
-
-function selectBlock(index) {
-    currentMaterialType = blockTypes[index];
-    // Update UI
-    const slots = document.querySelectorAll('.slot');
-    slots.forEach(slot => slot.classList.remove('active'));
-    if (slots[index]) {
-        slots[index].classList.add('active');
-    }
-}
 
 function onWindowResize() {
     camera.aspect = window.innerWidth / window.innerHeight;
