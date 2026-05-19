@@ -1,10 +1,13 @@
 import * as THREE from "three";
 import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
 import RAPIER from "@dimforge/rapier3d-compat";
+import SimplexNoise from "simplex-noise";
 
 // --- Global Variables ---
 let camera, scene, renderer, controls;
 let raycaster;
+let directionalLight, ambientLight;
+let timeOfDay = 0; // 0 to 2PI
 
 // Rapier Physics
 let world, characterController, playerBody, playerCollider;
@@ -258,11 +261,21 @@ async function init() {
   scene.fog = new THREE.Fog(0x87ceeb, 10, renderDistance);
 
   // --- Lighting ---
-  const ambientLight = new THREE.AmbientLight(0xeeeeee, 0.6);
+  ambientLight = new THREE.AmbientLight(0xeeeeee, 0.6);
   scene.add(ambientLight);
 
-  const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
-  directionalLight.position.set(10, 20, 10);
+  directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+  directionalLight.position.set(50, 100, 50);
+  directionalLight.castShadow = true;
+  directionalLight.shadow.mapSize.width = 2048;
+  directionalLight.shadow.mapSize.height = 2048;
+  directionalLight.shadow.camera.near = 0.5;
+  directionalLight.shadow.camera.far = 500;
+  directionalLight.shadow.camera.left = -50;
+  directionalLight.shadow.camera.right = 50;
+  directionalLight.shadow.camera.top = 50;
+  directionalLight.shadow.camera.bottom = -50;
+  directionalLight.shadow.bias = -0.001;
   scene.add(directionalLight);
 
   // --- Camera & Renderer ---
@@ -274,6 +287,8 @@ async function init() {
   );
 
   renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   renderer.setPixelRatio(window.devicePixelRatio);
   renderer.setSize(window.innerWidth, window.innerHeight);
   document.body.appendChild(renderer.domElement);
@@ -452,24 +467,57 @@ inventory[6] = { type: "brick", count: 64 };
 inventory[7] = { type: "glass", count: 64 };
 
 function generateWorld() {
-  // Generate a simple 20x20 flat grid
-  const gridSize = 20;
+  const simplex = new SimplexNoise();
+  const gridSize = 40; // Larger grid for terrain
   for (let x = -gridSize / 2; x < gridSize / 2; x++) {
     for (let z = -gridSize / 2; z < gridSize / 2; z++) {
-      // Bedrock / Bottom layer (stone)
-      addBlock(x, -2, z, "stone");
+      // Base height using noise
+      const yStr = (simplex.noise2D(x / 20, z / 20) + 1) / 2; // 0 to 1
+      const height = Math.floor(yStr * 8); // 0 to 8 blocks high
 
+      // Stone foundation
+      for (let y = -4; y < height - 2; y++) {
+        addBlock(x, y, z, "stone");
+      }
       // Dirt layer
-      addBlock(x, -1, z, "dirt");
-
-      // Surface layer
-      addBlock(x, 0, z, "grass");
+      for (let y = Math.max(-4, height - 2); y < height; y++) {
+        addBlock(x, y, z, "dirt");
+      }
+      // Grass layer / Sand near bottom
+      const topBlock = height <= 1 ? "sand" : "grass";
+      addBlock(x, height, z, topBlock);
+      
+      // Trees
+      if (topBlock === "grass" && Math.random() < 0.01) {
+         generateTree(x, height + 1, z);
+      }
     }
   }
 }
 
+function generateTree(x, y, z) {
+    const treeHeight = Math.floor(Math.random() * 3) + 4;
+    // Trunk
+    for (let i = 0; i < treeHeight; i++) {
+        addBlock(x, y + i, z, "wood");
+    }
+    // Leaves
+    for (let lx = -2; lx <= 2; lx++) {
+        for (let lz = -2; lz <= 2; lz++) {
+            for (let ly = treeHeight - 2; ly <= treeHeight + 1; ly++) {
+                // Shape leaves into a sphere-like cluster
+                if (Math.abs(lx) === 2 && Math.abs(lz) === 2 && ly === treeHeight + 1) continue;
+                if (lx === 0 && lz === 0 && ly < treeHeight) continue; // skip trunk blocks
+                addBlock(x + lx, y + ly, z + lz, "leaves");
+            }
+        }
+    }
+}
+
 function addBlock(x, y, z, type) {
   const mesh = new THREE.Mesh(blockGeometry, materials[type]);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
   mesh.position.set(x, y, z);
   mesh.userData = { type: type };
 
@@ -776,6 +824,33 @@ function animate() {
   requestAnimationFrame(animate);
 
   const time = performance.now();
+  const rawDelta = (time - prevTime) / 1000;
+  
+  // Day/Night Cycle (1 full day every 2 minutes = 120 seconds -> 2*PI/120 speed)
+  timeOfDay += rawDelta * (Math.PI * 2 / 120);
+  if (timeOfDay > Math.PI * 2) timeOfDay -= Math.PI * 2;
+  
+  // Update sunlight string
+  const sunX = Math.cos(timeOfDay) * 100;
+  const sunY = Math.sin(timeOfDay) * 100;
+  const sunZ = Math.sin(timeOfDay) * 40; // slight angle
+  
+  directionalLight.position.set(sunX, sunY, sunZ);
+  
+  // If sun is below horizon, diminish its intensity and color
+  let intensity = Math.max(0, Math.sin(timeOfDay));
+  directionalLight.intensity = intensity * 1.5;
+  
+  // Sky color changes
+  if (intensity > 0) {
+      scene.background.setHSL(0.55, 0.5, 0.5 + intensity * 0.3);
+      scene.fog.color.copy(scene.background);
+      ambientLight.intensity = 0.2 + intensity * 0.4;
+  } else {
+      scene.background.setHex(0x050515); // Night sky
+      scene.fog.color.copy(scene.background);
+      ambientLight.intensity = 0.1;
+  }
 
   if (controls.isLocked === true) {
     // Highlighting / RollOver update
