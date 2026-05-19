@@ -35,7 +35,11 @@ const keyBinds = {
     slot2: 'Digit2',
     slot3: 'Digit3',
     slot4: 'Digit4',
-    slot5: 'Digit5'
+    slot5: 'Digit5',
+    slot6: 'Digit6',
+    slot7: 'Digit7',
+    slot8: 'Digit8',
+    slot9: 'Digit9'
 };
 
 let prevTime = performance.now();
@@ -457,16 +461,27 @@ function performInteract(actionName) {
             if (intersect.object.position.y > -2) {
                 const type = intersect.object.userData.type;
                 removeBlock(intersect.object);
-                // Add to inventory (simplistic: find first stack or empty slot)
+                
+                let added = false;
+                // First pass: look for an existing stack of the same type that is not full
                 for (let i = 0; i < 36; i++) {
                     if (inventory[i] && inventory[i].type === type && inventory[i].count < 64) {
                         inventory[i].count++;
-                        break;
-                    } else if (!inventory[i]) {
-                        inventory[i] = { type: type, count: 1 };
+                        added = true;
                         break;
                     }
                 }
+                
+                // Second pass: if we couldn't stack it, find the first empty slot
+                if (!added) {
+                    for (let i = 0; i < 36; i++) {
+                        if (!inventory[i]) {
+                            inventory[i] = { type: type, count: 1 };
+                            break;
+                        }
+                    }
+                }
+                
                 renderInventory();
             }
         } 
@@ -526,6 +541,18 @@ function onInputDown(inputStr) {
         case keyBinds.slot5:
             selectHotbarSlot(4);
             break;
+        case keyBinds.slot6:
+            selectHotbarSlot(5);
+            break;
+        case keyBinds.slot7:
+            selectHotbarSlot(6);
+            break;
+        case keyBinds.slot8:
+            selectHotbarSlot(7);
+            break;
+        case keyBinds.slot9:
+            selectHotbarSlot(8);
+            break;
     }
 }
 
@@ -542,6 +569,23 @@ function toggleInventory() {
     } else {
         invScreen.style.display = 'none';
         controls.lock();
+    }
+}
+
+function onInputUp(inputStr) {
+    switch (inputStr) {
+        case keyBinds.forward:
+            moveForward = false;
+            break;
+        case keyBinds.left:
+            moveLeft = false;
+            break;
+        case keyBinds.backward:
+            moveBackward = false;
+            break;
+        case keyBinds.right:
+            moveRight = false;
+            break;
     }
 }
 
@@ -672,14 +716,15 @@ function animate() {
 
         const speed = 10.0; // Movement speed
         
-        // Calculate forward and right vectors based on where the camera is facing
-        const front = new THREE.Vector3();
-        controls.getDirection(front);
-        front.y = 0; // Keep movement purely horizontal
-        front.normalize();
-
+        // When Pitching up/down, camera's local X-axis (Right) is unaffected. 
+        // We use it to reliably extract horizontal Forward and Right vectors regardless of Gimbal lock.
         const right = new THREE.Vector3();
-        right.crossVectors(front, new THREE.Vector3(0, 1, 0)).normalize();
+        right.setFromMatrixColumn(camera.matrix, 0);
+        right.y = 0;
+        right.normalize();
+
+        const front = new THREE.Vector3();
+        front.crossVectors(new THREE.Vector3(0, 1, 0), right).normalize();
 
         const moveVec = new THREE.Vector3();
         if (moveForward) moveVec.add(front);
