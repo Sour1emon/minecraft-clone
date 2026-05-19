@@ -14,7 +14,7 @@ let world, characterController, playerBody, playerCollider;
 
 let moveForward = false, moveBackward = false, moveLeft = false, moveRight = false;
 let canJump = false;
-let renderDistance = 10;
+let renderDistanceChunks = 6;
 let isRebinding = false;
 
 const keyBinds = {
@@ -38,10 +38,14 @@ let lastDprEval = 0;
 const CHUNK_SIZE = 16;
 // blockMap: "x,y,z" -> blockType string. Single source of truth for world state.
 const blockMap = new Map();
+// chunkBlockIndex: "cx,cz" -> Set("x,y,z"), allows fast per-chunk iteration.
+const chunkBlockIndex = new Map();
 // chunkMeshes: "cx,cz" -> { opaque: Mesh, transparent: Mesh } (rebuilt on change)
 const chunkMeshes = new Map();
 // Chunks dirty-flagged for rebuild next frame
 const dirtyChunks = new Set();
+// Generated terrain chunks (persists terrain data even if meshes unload)
+const generatedChunks = new Set();
 // Raycaster target list (opaque chunk meshes within range)
 const visibleObjects = [];
 
@@ -62,6 +66,8 @@ let _rapierMovement = null;
 let needsVisibleRebuild = true;
 let lastPlayerChunkX = Number.NaN;
 let lastPlayerChunkZ = Number.NaN;
+const terrainNoise = new SimplexNoise();
+const TREE_NOISE_OFFSET = 1337;
 
 // --- Texture Generation ---
 const iconUris = {};
@@ -158,6 +164,39 @@ function getFaceTexture(blockType, faceDir) {
 }
 
 const TRANSPARENT_TYPES = new Set(["glass", "leaves"]);
+const WORLD_MIN_Y = -8;
+const WORLD_MAX_Y = 48;
+
+function getRenderDistanceBlocks() {
+  return renderDistanceChunks * CHUNK_SIZE;
+}
+
+function getChunkCoordsFromWorld(x, z) {
+  return [Math.floor(x / CHUNK_SIZE), Math.floor(z / CHUNK_SIZE)];
+}
+
+function getChunkKeyFromWorld(x, z) {
+  const [cx, cz] = getChunkCoordsFromWorld(x, z);
+  return `${cx},${cz}`;
+}
+
+function indexBlockInChunk(posKey, x, z) {
+  const chunkKey = getChunkKeyFromWorld(x, z);
+  let chunkSet = chunkBlockIndex.get(chunkKey);
+  if (!chunkSet) {
+    chunkSet = new Set();
+    chunkBlockIndex.set(chunkKey, chunkSet);
+  }
+  chunkSet.add(posKey);
+}
+
+function unindexBlockFromChunk(posKey, x, z) {
+  const chunkKey = getChunkKeyFromWorld(x, z);
+  const chunkSet = chunkBlockIndex.get(chunkKey);
+  if (!chunkSet) return;
+  chunkSet.delete(posKey);
+  if (chunkSet.size === 0) chunkBlockIndex.delete(chunkKey);
+}
 
 // Build or rebuild the mesh for one chunk.
 // Iterates all blocks in the chunk, emits only faces whose neighbor is absent.
@@ -168,50 +207,41 @@ function buildChunkMesh(chunkX, chunkZ) {
   const opaqueBufs = {};   // texName -> arrays
   const transBufs = {};    // texName -> arrays
 
-  const x0 = chunkX * CHUNK_SIZE;
-  const z0 = chunkZ * CHUNK_SIZE;
+  const blockKeys = chunkBlockIndex.get(`${chunkX},${chunkZ}`);
+  if (!blockKeys || blockKeys.size === 0) return { opaqueBufs, transBufs };
 
-  // Scan all blocks in this chunk by checking blockMap entries
-  // We use a bounding scan — faster than filtering the whole blockMap
-  for (let lx = 0; lx < CHUNK_SIZE; lx++) {
-    for (let lz = 0; lz < CHUNK_SIZE; lz++) {
-      const wx = x0 + lx;
-      const wz = z0 + lz;
-      // Find all y values at this column that have a block
-      // We scan a vertical range — adjust min/max if your world is taller
-      for (let wy = -10; wy < 30; wy++) {
-        const blockType = blockMap.get(`${wx},${wy},${wz}`);
-        if (!blockType) continue;
+  for (const posKey of blockKeys) {
+    const [wx, wy, wz] = posKey.split(",").map(Number);
+    const blockType = blockMap.get(posKey);
+    if (!blockType) continue;
 
-        const isTransparent = TRANSPARENT_TYPES.has(blockType);
+    const isTransparent = TRANSPARENT_TYPES.has(blockType);
 
-        for (const face of FACES) {
-          const [dx, dy, dz] = face.dir;
-          const neighborKey = `${wx+dx},${wy+dy},${wz+dz}`;
-          const neighbor = blockMap.get(neighborKey);
+    for (const face of FACES) {
+      const [dx, dy, dz] = face.dir;
+      const neighborKey = `${wx+dx},${wy+dy},${wz+dz}`;
+      const neighbor = blockMap.get(neighborKey);
 
-          // Skip this face if neighbor is a fully opaque block
-          // (transparent blocks always show their faces next to other transparent blocks)
-          if (neighbor && !TRANSPARENT_TYPES.has(neighbor)) continue;
-          // Also skip if both are same transparent type (glass next to glass hides the face)
-          if (neighbor && isTransparent && neighbor === blockType) continue;
+      // Skip this face if neighbor is a fully opaque block
+      // (transparent blocks always show their faces next to other transparent blocks)
+      if (neighbor && !TRANSPARENT_TYPES.has(neighbor)) continue;
+      // Also skip if both are same transparent type (glass next to glass hides the face)
+      if (neighbor && isTransparent && neighbor === blockType) continue;
 
-          const texName = getFaceTexture(blockType, face.dir);
-          const bufs = isTransparent ? transBufs : opaqueBufs;
-          if (!bufs[texName]) bufs[texName] = { positions:[], normals:[], uvs:[], indices:[] };
-          const buf = bufs[texName];
+      const texName = getFaceTexture(blockType, face.dir);
+      const bufs = isTransparent ? transBufs : opaqueBufs;
+      if (!bufs[texName]) bufs[texName] = { positions:[], normals:[], uvs:[], indices:[] };
+      const buf = bufs[texName];
 
-          const base = buf.positions.length / 3; // vertex index base
-          for (let v = 0; v < 4; v++) {
-            const [vx,vy,vz] = face.verts[v];
-            buf.positions.push(wx+vx, wy+vy, wz+vz);
-            buf.normals.push(dx, dy, dz);
-            buf.uvs.push(face.uvs[v][0], face.uvs[v][1]);
-          }
-          // Two triangles per quad (CCW)
-          buf.indices.push(base, base+1, base+2, base, base+2, base+3);
-        }
+      const base = buf.positions.length / 3; // vertex index base
+      for (let v = 0; v < 4; v++) {
+        const [vx,vy,vz] = face.verts[v];
+        buf.positions.push(wx+vx, wy+vy, wz+vz);
+        buf.normals.push(dx, dy, dz);
+        buf.uvs.push(face.uvs[v][0], face.uvs[v][1]);
       }
+      // Two triangles per quad (CCW)
+      buf.indices.push(base, base+1, base+2, base, base+2, base+3);
     }
   }
 
@@ -318,11 +348,18 @@ function flushDirtyChunks() {
 }
 
 // --- Block Map Helpers ---
-function addBlock(x, y, z, type) {
+function setBlockInternal(x, y, z, type, markDirty = true) {
+  if (y < WORLD_MIN_Y || y > WORLD_MAX_Y) return false;
   const posKey = `${x},${y},${z}`;
-  if (blockMap.has(posKey)) return;
+  if (blockMap.has(posKey)) return false;
   blockMap.set(posKey, type);
-  markChunkDirty(x, y, z);
+  indexBlockInChunk(posKey, x, z);
+  if (markDirty) markChunkDirty(x, y, z);
+  return true;
+}
+
+function addBlock(x, y, z, type) {
+  setBlockInternal(x, y, z, type, true);
 }
 
 function removeBlock(posKey) {
@@ -330,6 +367,7 @@ function removeBlock(posKey) {
   // Parse position from key
   const [x, y, z] = posKey.split(",").map(Number);
   blockMap.delete(posKey);
+  unindexBlockFromChunk(posKey, x, z);
   markChunkDirty(x, y, z);
   // Remove physics if present
   const body = blockPhysics.get(posKey);
@@ -341,11 +379,15 @@ function clearWorld() {
   for (const [key] of chunkMeshes) disposeChunkMeshes(key);
   chunkMeshes.clear();
   blockMap.clear();
+  chunkBlockIndex.clear();
+  generatedChunks.clear();
   blockPhysics.forEach(body => world.removeRigidBody(body));
   blockPhysics.clear();
   dirtyChunks.clear();
   visibleObjects.length = 0;
   needsVisibleRebuild = true;
+  lastPlayerChunkX = Number.NaN;
+  lastPlayerChunkZ = Number.NaN;
   playerBody.setTranslation(new RAPIER.Vector3(0, 5, 0), true);
   velocity.set(0, 0, 0);
 }
@@ -354,12 +396,13 @@ function clearWorld() {
 function rebuildVisibleObjects() {
   visibleObjects.length = 0;
   const playerPos = camera ? camera.position : new THREE.Vector3();
+  const renderDistanceBlocks = getRenderDistanceBlocks();
   for (const [key, meshes] of chunkMeshes) {
     const [cx, cz] = key.split(",").map(Number);
     const chunkWorldX = cx * CHUNK_SIZE + CHUNK_SIZE / 2;
     const chunkWorldZ = cz * CHUNK_SIZE + CHUNK_SIZE / 2;
     const dist = Math.hypot(playerPos.x - chunkWorldX, playerPos.z - chunkWorldZ);
-    if (dist < renderDistance) {
+    if (dist < renderDistanceBlocks + CHUNK_SIZE) {
       for (const mesh of meshes) {
         if (!mesh.userData.isTransparent) visibleObjects.push(mesh);
       }
@@ -376,21 +419,16 @@ function updatePhysicsBodies(playerPos) {
   // Add physics for nearby blocks that lack it
   for (let cx = playerChunkX - chunkRadius; cx <= playerChunkX + chunkRadius; cx++) {
     for (let cz = playerChunkZ - chunkRadius; cz <= playerChunkZ + chunkRadius; cz++) {
-      // Scan blocks in this chunk column range
-      for (let lx = 0; lx < CHUNK_SIZE; lx++) {
-        for (let lz = 0; lz < CHUNK_SIZE; lz++) {
-          const wx = cx * CHUNK_SIZE + lx;
-          const wz = cz * CHUNK_SIZE + lz;
-          for (let wy = -10; wy < 30; wy++) {
-            const posKey = `${wx},${wy},${wz}`;
-            if (!blockMap.has(posKey) || blockPhysics.has(posKey)) continue;
-            const dist = Math.hypot(wx - playerPos.x, wy - playerPos.y, wz - playerPos.z);
-            if (dist < PHYSICS_CULLING_DISTANCE) {
-              const rb = world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(wx, wy, wz));
-              world.createCollider(RAPIER.ColliderDesc.cuboid(0.5, 0.5, 0.5), rb);
-              blockPhysics.set(posKey, rb);
-            }
-          }
+      const chunkSet = chunkBlockIndex.get(`${cx},${cz}`);
+      if (!chunkSet) continue;
+      for (const posKey of chunkSet) {
+        if (blockPhysics.has(posKey)) continue;
+        const [wx, wy, wz] = posKey.split(",").map(Number);
+        const dist = Math.hypot(wx - playerPos.x, wy - playerPos.y, wz - playerPos.z);
+        if (dist < PHYSICS_CULLING_DISTANCE) {
+          const rb = world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(wx, wy, wz));
+          world.createCollider(RAPIER.ColliderDesc.cuboid(0.5, 0.5, 0.5), rb);
+          blockPhysics.set(posKey, rb);
         }
       }
     }
@@ -409,70 +447,103 @@ function updatePhysicsBodies(playerPos) {
 
 // --- World Generation ---
 function generateWorld() {
-  const simplex = new SimplexNoise();
-  const gridSize = 40;
-  const columns = [];
-  for (let x = -gridSize/2; x < gridSize/2; x++)
-    for (let z = -gridSize/2; z < gridSize/2; z++)
-      columns.push([x, z]);
-
-  // Process in batches to avoid freezing the main thread
-  const BATCH_SIZE = 80;
-  let idx = 0;
-
-  function processBatch() {
-    const end = Math.min(idx + BATCH_SIZE, columns.length);
-    for (; idx < end; idx++) {
-      const [x, z] = columns[idx];
-      const yStr = (simplex.noise2D(x / 20, z / 20) + 1) / 2;
-      const height = Math.floor(yStr * 8);
-      for (let y = -4; y < height - 2; y++) blockMap.set(`${x},${y},${z}`, "stone");
-      for (let y = Math.max(-4, height-2); y < height; y++) blockMap.set(`${x},${y},${z}`, "dirt");
-      const topType = height <= 1 ? "sand" : "grass";
-      blockMap.set(`${x},${height},${z}`, topType);
-      if (topType === "grass" && Math.random() < 0.01) addTreeToMap(x, height + 1, z);
-    }
-    if (idx < columns.length) {
-      requestAnimationFrame(processBatch);
-    } else {
-      // All blocks placed — now do one bulk chunk build pass
-      buildAllChunks();
-    }
-  }
-  requestAnimationFrame(processBatch);
+  ensureChunksAroundPlayer(new THREE.Vector3(0, 0, 0));
 }
 
-function addTreeToMap(x, y, z) {
-  const h = Math.floor(Math.random() * 3) + 4;
-  for (let i = 0; i < h; i++) blockMap.set(`${x},${y+i},${z}`, "wood");
+function getTerrainHeight(x, z) {
+  const continental = (terrainNoise.noise2D(x / 120, z / 120) + 1) * 0.5;
+  const detail = (terrainNoise.noise2D(x / 40, z / 40) + 1) * 0.5;
+  const peaks = (terrainNoise.noise2D(x / 18, z / 18) + 1) * 0.5;
+  const h = Math.floor(-2 + continental * 12 + detail * 6 + peaks * 3);
+  return Math.min(WORLD_MAX_Y - 6, Math.max(WORLD_MIN_Y + 2, h));
+}
+
+function shouldSpawnTree(x, z) {
+  const v = (terrainNoise.noise2D((x + TREE_NOISE_OFFSET) / 24, (z - TREE_NOISE_OFFSET) / 24) + 1) * 0.5;
+  return v > 0.87;
+}
+
+function addTreeToMap(x, y, z, touchedChunks) {
+  const heightNoise = (terrainNoise.noise2D((x - TREE_NOISE_OFFSET) / 12, (z + TREE_NOISE_OFFSET) / 12) + 1) * 0.5;
+  const h = 4 + Math.floor(heightNoise * 3);
+  for (let i = 0; i < h; i++) {
+    if (setBlockInternal(x, y + i, z, "wood", false)) touchedChunks.add(getChunkKeyFromWorld(x, z));
+  }
   for (let lx = -2; lx <= 2; lx++) for (let lz = -2; lz <= 2; lz++) for (let ly = h-2; ly <= h+1; ly++) {
     if (Math.abs(lx)===2 && Math.abs(lz)===2 && ly===h+1) continue;
     if (lx===0 && lz===0 && ly<h) continue;
-    const key = `${x+lx},${y+ly},${z+lz}`;
-    if (!blockMap.has(key)) blockMap.set(key, "leaves");
+    const wx = x + lx;
+    const wy = y + ly;
+    const wz = z + lz;
+    if (setBlockInternal(wx, wy, wz, "leaves", false)) touchedChunks.add(getChunkKeyFromWorld(wx, wz));
   }
 }
 
-// After world gen completes, find which chunks exist and build them all
-function buildAllChunks() {
-  const chunkSet = new Set();
-  for (const key of blockMap.keys()) {
-    const [x,,z] = key.split(",").map(Number);
-    chunkSet.add(`${Math.floor(x/CHUNK_SIZE)},${Math.floor(z/CHUNK_SIZE)}`);
-  }
-  // Build in batches too — each chunk build is ~1ms
-  const chunkList = [...chunkSet];
-  let ci = 0;
-  function buildBatch() {
-    const end = Math.min(ci + 4, chunkList.length);
-    for (; ci < end; ci++) {
-      const [cx, cz] = chunkList[ci].split(",").map(Number);
-      rebuildChunk(cx, cz);
+function generateChunk(chunkX, chunkZ) {
+  const chunkKey = `${chunkX},${chunkZ}`;
+  if (generatedChunks.has(chunkKey)) return;
+
+  const touchedChunks = new Set([chunkKey]);
+  const x0 = chunkX * CHUNK_SIZE;
+  const z0 = chunkZ * CHUNK_SIZE;
+
+  for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+    for (let lz = 0; lz < CHUNK_SIZE; lz++) {
+      const wx = x0 + lx;
+      const wz = z0 + lz;
+      const height = getTerrainHeight(wx, wz);
+      for (let y = WORLD_MIN_Y; y < height - 3; y++) {
+        if (setBlockInternal(wx, y, wz, "stone", false)) touchedChunks.add(getChunkKeyFromWorld(wx, wz));
+      }
+      for (let y = Math.max(WORLD_MIN_Y, height - 3); y < height; y++) {
+        if (setBlockInternal(wx, y, wz, "dirt", false)) touchedChunks.add(getChunkKeyFromWorld(wx, wz));
+      }
+      const topType = height <= 1 ? "sand" : "grass";
+      if (setBlockInternal(wx, height, wz, topType, false)) touchedChunks.add(getChunkKeyFromWorld(wx, wz));
+      if (topType === "grass" && shouldSpawnTree(wx, wz)) {
+        addTreeToMap(wx, height + 1, wz, touchedChunks);
+      }
     }
-    if (ci < chunkList.length) requestAnimationFrame(buildBatch);
-    else needsVisibleRebuild = true;
   }
-  requestAnimationFrame(buildBatch);
+
+  generatedChunks.add(chunkKey);
+  for (const dirtyKey of touchedChunks) dirtyChunks.add(dirtyKey);
+  needsVisibleRebuild = true;
+}
+
+function unloadFarChunkMeshes(playerChunkX, playerChunkZ, keepRadius) {
+  let removedAny = false;
+  for (const key of chunkMeshes.keys()) {
+    const [cx, cz] = key.split(",").map(Number);
+    if (Math.abs(cx - playerChunkX) > keepRadius || Math.abs(cz - playerChunkZ) > keepRadius) {
+      disposeChunkMeshes(key);
+      removedAny = true;
+    }
+  }
+  if (removedAny) needsVisibleRebuild = true;
+}
+
+function ensureChunksAroundPlayer(playerPos) {
+  const playerChunkX = Math.floor(playerPos.x / CHUNK_SIZE);
+  const playerChunkZ = Math.floor(playerPos.z / CHUNK_SIZE);
+  const generationRadius = Math.max(2, renderDistanceChunks + 1);
+  const missingChunks = [];
+  for (let cx = playerChunkX - generationRadius; cx <= playerChunkX + generationRadius; cx++) {
+    for (let cz = playerChunkZ - generationRadius; cz <= playerChunkZ + generationRadius; cz++) {
+      const key = `${cx},${cz}`;
+      if (generatedChunks.has(key)) continue;
+      const dist = Math.abs(cx - playerChunkX) + Math.abs(cz - playerChunkZ);
+      missingChunks.push({ cx, cz, dist });
+    }
+  }
+  missingChunks.sort((a, b) => a.dist - b.dist);
+  const CHUNK_GEN_BUDGET_PER_UPDATE = 6;
+  const count = Math.min(CHUNK_GEN_BUDGET_PER_UPDATE, missingChunks.length);
+  for (let i = 0; i < count; i++) {
+    const { cx, cz } = missingChunks[i];
+    generateChunk(cx, cz);
+  }
+  unloadFarChunkMeshes(playerChunkX, playerChunkZ, generationRadius + 2);
 }
 
 // --- Inventory ---
@@ -495,7 +566,7 @@ async function init() {
 
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0x87ceeb);
-  scene.fog = new THREE.Fog(0x87ceeb, 10, renderDistance);
+  scene.fog = new THREE.Fog(0x87ceeb, 10, getRenderDistanceBlocks());
 
   ambientLight = new THREE.AmbientLight(0xeeeeee, 0.6);
   scene.add(ambientLight);
@@ -553,10 +624,15 @@ async function init() {
 
   const sliderRenderDist = document.getElementById("graphics-render-distance");
   const lblRenderDist = document.getElementById("lbl-render-distance");
+  sliderRenderDist.min = "2";
+  sliderRenderDist.max = "16";
+  sliderRenderDist.step = "1";
+  sliderRenderDist.value = String(renderDistanceChunks);
+  lblRenderDist.innerText = `${renderDistanceChunks} chunks`;
   sliderRenderDist.addEventListener("input", (e)=>{
-    renderDistance = parseInt(e.target.value);
-    lblRenderDist.innerText = `${renderDistance} chunks`;
-    scene.fog.far = renderDistance;
+    renderDistanceChunks = parseInt(e.target.value, 10);
+    lblRenderDist.innerText = `${renderDistanceChunks} chunks`;
+    scene.fog.far = getRenderDistanceBlocks();
     needsVisibleRebuild = true;
   });
 
@@ -835,6 +911,7 @@ function animate() {
     const playerChunkX = Math.floor(camera.position.x / CHUNK_SIZE);
     const playerChunkZ = Math.floor(camera.position.z / CHUNK_SIZE);
     const movedChunk = playerChunkX !== lastPlayerChunkX || playerChunkZ !== lastPlayerChunkZ;
+    ensureChunksAroundPlayer(camera.position);
     if (needsVisibleRebuild || movedChunk) {
       rebuildVisibleObjects();
       needsVisibleRebuild = false;
