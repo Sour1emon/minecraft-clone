@@ -28,11 +28,16 @@ let prevTime = performance.now();
 const velocity = new THREE.Vector3();
 let lastInventoryUpdate = 0;
 const INVENTORY_UPDATE_THROTTLE = 50;
-const BASE_PIXEL_RATIO = Math.min(window.devicePixelRatio, 2);
+// Performance settings: enable `lowQualityMode` to prioritize smoothness over visual fidelity
+const PERFORMANCE = { lowQualityMode: true };
+const BASE_PIXEL_RATIO = Math.min(window.devicePixelRatio, PERFORMANCE.lowQualityMode ? 1.25 : 2);
 let currentPixelRatio = BASE_PIXEL_RATIO;
 let targetPixelRatio = BASE_PIXEL_RATIO;
 let smoothedFrameMs = 16.7;
 let lastDprEval = 0;
+// Logging
+const LOG_STATUS_INTERVAL = 5000; // ms
+let _lastStatusLog = 0;
 
 // --- Chunk System ---
 const CHUNK_SIZE = 16;
@@ -54,6 +59,9 @@ const PHYSICS_CULLING_DISTANCE = 30;
 const blockPhysics = new Map();
 // Reused materials keyed by "texture|opaque/transparent"
 const materialCache = new Map();
+// Instanced rendering: per-block-type instanced meshes
+const instancedMeshes = new Map();
+PERFORMANCE.instancing = true;
 
 // Preallocated per-frame vectors
 const _right = new THREE.Vector3();
@@ -127,7 +135,9 @@ function generateTexture(type) {
 
 // Pre-generate all textures up front so there's no stutter on first block of each type
 const TEX_TYPES = ["dirt","stone","grass_top","grass_side","wood_top","wood_side","leaves","sand","brick","glass"];
-TEX_TYPES.forEach(generateTexture);
+// Defer texture pre-generation until after init to avoid blocking startup
+// (we still lazily generate on-demand inside getChunkMaterial)
+// TEX_TYPES.forEach(generateTexture);
 iconUris["grass"] = iconUris["grass_side"];
 iconUris["wood"] = iconUris["wood_side"];
 
@@ -276,11 +286,17 @@ function createChunkMeshObjects(chunkX, chunkZ, opaqueBufs, transBufs) {
       geo.setAttribute("uv",       new THREE.Float32BufferAttribute(buf.uvs, 2));
       geo.setIndex(buf.indices);
 
+      // Compute bounding volumes so Three's frustum culling can skip off-screen chunks
+      geo.computeBoundingBox();
+      geo.computeBoundingSphere();
+
       const mat = getChunkMaterial(texName, transparent);
 
       const mesh = new THREE.Mesh(geo, mat);
       mesh.castShadow = !transparent;
       mesh.receiveShadow = true;
+      mesh.frustumCulled = true;
+      mesh.matrixAutoUpdate = false; // static chunk meshes don't need matrix updates
       mesh.userData = { chunkX, chunkZ, isTransparent: transparent };
       scene.add(mesh);
       meshes.push(mesh);
@@ -304,13 +320,62 @@ function disposeChunkMeshes(chunkKey) {
   chunkMeshes.delete(chunkKey);
 }
 
+function disposeInstancedMeshes() {
+  for (const [k, im] of instancedMeshes) {
+    scene.remove(im);
+    if (im.geometry) im.geometry.dispose();
+    if (im.material) im.material.dispose();
+  }
+  instancedMeshes.clear();
+}
+
 // Full rebuild for one chunk — called when dirty
 function rebuildChunk(chunkX, chunkZ) {
   const chunkKey = `${chunkX},${chunkZ}`;
   disposeChunkMeshes(chunkKey);
   const { opaqueBufs, transBufs } = buildChunkMesh(chunkX, chunkZ);
-  const meshes = createChunkMeshObjects(chunkX, chunkZ, opaqueBufs, transBufs);
-  chunkMeshes.set(chunkKey, meshes);
+  if (!PERFORMANCE.instancing) {
+    const meshes = createChunkMeshObjects(chunkX, chunkZ, opaqueBufs, transBufs);
+    chunkMeshes.set(chunkKey, meshes);
+  }
+  // If instancing is enabled, we'll rebuild global instanced meshes after chunk updates
+}
+
+// Build per-type instanced meshes from `blockMap`. This is a full rebuild and can be
+// expensive for very large worlds; we call it only when chunks change.
+function rebuildInstancedMeshes() {
+  disposeInstancedMeshes();
+  const buckets = new Map(); // texName -> array of positions
+  for (const [posKey, type] of blockMap) {
+    const [x, y, z] = posKey.split(",").map(Number);
+    const tex = getFaceTexture(type, [0,1,0]); // use top texture as representative
+    const key = `${tex}|${TRANSPARENT_TYPES.has(type) ? 't' : 'o'}`;
+    if (!buckets.has(key)) buckets.set(key, { type, tex, positions: [] });
+    buckets.get(key).positions.push(new THREE.Vector3(x, y, z));
+  }
+
+  const boxGeo = new THREE.BoxGeometry(1,1,1);
+  const tmpMat = new THREE.Matrix4();
+  for (const [key, bucket] of buckets) {
+    const count = bucket.positions.length;
+    if (count === 0) continue;
+    const mat = new THREE.MeshLambertMaterial({ map: generateTexture(bucket.tex), transparent: key.endsWith('|t'), alphaTest: key.endsWith('|t') ? 0.1 : 0 });
+    const im = new THREE.InstancedMesh(boxGeo, mat, count);
+    im.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    for (let i=0;i<count;i++){
+      tmpMat.makeTranslation(bucket.positions[i].x, bucket.positions[i].y, bucket.positions[i].z);
+      im.setMatrixAt(i, tmpMat);
+    }
+    // compute bounding box for quick culling
+    const box = new THREE.Box3();
+    for (let p of bucket.positions) box.expandByPoint(p);
+    box.min.x -= 0.5; box.min.y -= 0.5; box.min.z -= 0.5;
+    box.max.x += 0.5; box.max.y += 0.5; box.max.z += 0.5;
+    im.userData = { isTransparent: key.endsWith('|t'), boundingBox: box, positions: bucket.positions };
+    scene.add(im);
+    instancedMeshes.set(key, im);
+  }
+  needsVisibleRebuild = true;
 }
 
 // Mark a chunk and its face-adjacent neighbors dirty (needed when a block on a border changes)
@@ -330,8 +395,8 @@ function markChunkDirty(wx, wy, wz) {
 function flushDirtyChunks() {
   if (dirtyChunks.size === 0) return;
   const start = performance.now();
-  const MAX_CHUNK_REBUILDS_PER_FRAME = 2;
   const MAX_CHUNK_REBUILD_TIME_MS = 3;
+  const MAX_CHUNK_REBUILDS_PER_FRAME = PERFORMANCE.lowQualityMode ? 1 : 4;
   let rebuilt = 0;
 
   while (dirtyChunks.size > 0 && rebuilt < MAX_CHUNK_REBUILDS_PER_FRAME) {
@@ -345,6 +410,10 @@ function flushDirtyChunks() {
 
   // Delay visible list rebuild to the periodic culling step to avoid repeated scans in one frame.
   if (rebuilt > 0) needsVisibleRebuild = true;
+  // If instancing mode is enabled, rebuild instanced meshes to reflect changes
+  if (rebuilt > 0 && PERFORMANCE.instancing) {
+    rebuildInstancedMeshes();
+  }
 }
 
 // --- Block Map Helpers ---
@@ -359,7 +428,7 @@ function setBlockInternal(x, y, z, type, markDirty = true) {
 }
 
 function addBlock(x, y, z, type) {
-  setBlockInternal(x, y, z, type, true);
+  return setBlockInternal(x, y, z, type, true);
 }
 
 function removeBlock(posKey) {
@@ -388,7 +457,6 @@ function clearWorld() {
   needsVisibleRebuild = true;
   lastPlayerChunkX = Number.NaN;
   lastPlayerChunkZ = Number.NaN;
-  playerBody.setTranslation(new RAPIER.Vector3(0, 5, 0), true);
   velocity.set(0, 0, 0);
 }
 
@@ -397,16 +465,36 @@ function rebuildVisibleObjects() {
   visibleObjects.length = 0;
   const playerPos = camera ? camera.position : new THREE.Vector3();
   const renderDistanceBlocks = getRenderDistanceBlocks();
+  const frustum = new THREE.Frustum();
+  const projScreenMatrix = new THREE.Matrix4();
+  projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  frustum.setFromProjectionMatrix(projScreenMatrix);
   for (const [key, meshes] of chunkMeshes) {
     const [cx, cz] = key.split(",").map(Number);
     const chunkWorldX = cx * CHUNK_SIZE + CHUNK_SIZE / 2;
     const chunkWorldZ = cz * CHUNK_SIZE + CHUNK_SIZE / 2;
     const dist = Math.hypot(playerPos.x - chunkWorldX, playerPos.z - chunkWorldZ);
     if (dist < renderDistanceBlocks + CHUNK_SIZE) {
+      // frustum cull each mesh by its bounding box when available
       for (const mesh of meshes) {
-        if (!mesh.userData.isTransparent) visibleObjects.push(mesh);
+        if (mesh.userData.isTransparent) continue;
+        if (mesh.geometry && mesh.geometry.boundingBox === null) mesh.geometry.computeBoundingBox();
+        if (mesh.geometry && mesh.geometry.boundingBox) {
+          const box = mesh.geometry.boundingBox.clone().applyMatrix4(mesh.matrixWorld);
+          if (!frustum.intersectsBox(box)) continue;
+        }
+        visibleObjects.push(mesh);
       }
     }
+  }
+  // Include instanced meshes in the raycast list (cull by their stored bounding boxes)
+  for (const [key, im] of instancedMeshes) {
+    if (im.userData && im.userData.isTransparent) continue;
+    const box = im.userData && im.userData.boundingBox ? im.userData.boundingBox.clone() : null;
+    if (box) {
+      if (!frustum.intersectsBox(box)) continue;
+    }
+    visibleObjects.push(im);
   }
 }
 
@@ -448,6 +536,51 @@ function updatePhysicsBodies(playerPos) {
 // --- World Generation ---
 function generateWorld() {
   ensureChunksAroundPlayer(new THREE.Vector3(0, 0, 0));
+}
+
+// Synchronously generate and build chunk meshes around a center chunk (small radius)
+function generateChunksImmediate(centerX, centerZ, radius) {
+  for (let cx = centerX - radius; cx <= centerX + radius; cx++) {
+    for (let cz = centerZ - radius; cz <= centerZ + radius; cz++) {
+      generateChunk(cx, cz);
+      rebuildChunk(cx, cz);
+    }
+  }
+}
+
+// (Removed duplicate weaker helper) Use the chunk-based `generateChunksImmediate(centerX, centerZ, radius)` above
+
+// Place the player at a safe spawn position above terrain at (x,z)
+function positionPlayerAtSpawn(x = 0, z = 0) {
+  // Prefer actual generated blocks nearby to avoid spawning inside geometry.
+  const ix = Math.round(x), iz = Math.round(z);
+  const highest = findHighestBlockNearby(ix, iz, 2);
+  const top = (highest !== null) ? highest : getTerrainHeight(x, z);
+  const spawnY = top + 3.5; // place player a bit above the highest block
+  console.log(`Spawning player at (${x.toFixed(1)}, ${spawnY.toFixed(1)}, ${z.toFixed(1)}) above terrain height ${top}`);
+  if (playerBody && typeof playerBody.setNextKinematicTranslation === 'function') {
+    playerBody.setNextKinematicTranslation(new RAPIER.Vector3(x, spawnY, z));
+  } else if (playerBody && typeof playerBody.setTranslation === 'function') {
+    playerBody.setTranslation(new RAPIER.Vector3(x, spawnY, z), true);
+  }
+  if (controls && controls.getObject) controls.getObject().position.set(x, spawnY + 0.8, z);
+  needsVisibleRebuild = true;
+}
+
+// Find the highest block Y in a radius around integer world x,z coordinates.
+function findHighestBlockNearby(x, z, radius) {
+  let found = null;
+  for (let dx = -radius; dx <= radius; dx++) {
+    for (let dz = -radius; dz <= radius; dz++) {
+      for (let y = WORLD_MAX_Y; y >= WORLD_MIN_Y; y--) {
+        if (blockMap.has(`${x+dx},${y},${z+dz}`)) {
+          if (found === null || y > found) found = y;
+          break; // next column
+        }
+      }
+    }
+  }
+  return found;
 }
 
 function getTerrainHeight(x, z) {
@@ -538,7 +671,10 @@ function ensureChunksAroundPlayer(playerPos) {
   }
   missingChunks.sort((a, b) => a.dist - b.dist);
   const CHUNK_GEN_BUDGET_PER_UPDATE = 6;
-  const count = Math.min(CHUNK_GEN_BUDGET_PER_UPDATE, missingChunks.length);
+  // Adapt chunk generation budget to recent frame time to avoid jank
+  let CHUNK_GEN_BUDGET = PERFORMANCE.lowQualityMode ? 3 : CHUNK_GEN_BUDGET_PER_UPDATE;
+  if (smoothedFrameMs > 28) CHUNK_GEN_BUDGET = Math.max(1, Math.floor(CHUNK_GEN_BUDGET / 2));
+  const count = Math.min(CHUNK_GEN_BUDGET, missingChunks.length);
   for (let i = 0; i < count; i++) {
     const { cx, cz } = missingChunks[i];
     generateChunk(cx, cz);
@@ -589,8 +725,9 @@ async function init() {
 
   camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
 
-  const rendererInst = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
-  rendererInst.shadowMap.enabled = true;
+  const rendererInst = new THREE.WebGLRenderer({ antialias: !PERFORMANCE.lowQualityMode, powerPreference: "high-performance" });
+  // Disable expensive shadow rendering in low quality mode to improve frame stability
+  rendererInst.shadowMap.enabled = PERFORMANCE.lowQualityMode ? false : true;
   rendererInst.shadowMap.type = THREE.PCFShadowMap;
   rendererInst.shadowMap.autoUpdate = false;
   rendererInst.shadowMap.needsUpdate = true;
@@ -615,7 +752,7 @@ async function init() {
 
   document.getElementById("btn-resume").addEventListener("click", ()=>controls.lock());
   document.getElementById("btn-options").addEventListener("click", ()=>showMenu(menuOptions));
-  document.getElementById("btn-exit").addEventListener("click", ()=>{ clearWorld(); generateWorld(); controls.lock(); });
+  document.getElementById("btn-exit").addEventListener("click", ()=>{ clearWorld(); generateWorld(); positionPlayerAtSpawn(0,0); controls.lock(); });
   document.getElementById("btn-graphics").addEventListener("click", ()=>showMenu(menuGraphics));
   document.getElementById("btn-controls").addEventListener("click", ()=>showMenu(menuControls));
   document.getElementById("btn-options-done").addEventListener("click", ()=>showMenu(menuMain));
@@ -693,6 +830,16 @@ async function init() {
   renderInventory();
   selectHotbarSlot(0);
   generateWorld();
+  // Generate a small guaranteed spawn area synchronously and then position player
+  generateChunksImmediate(0, 0, 2);
+  // Defer heavy texture generation until after initial spawn
+  setTimeout(()=>{ TEX_TYPES.forEach(generateTexture); }, 200);
+  positionPlayerAtSpawn(0, 0);
+  // Ensure physics colliders exist around spawn immediately
+  const playerPos = (controls && controls.getObject) ? controls.getObject().position : camera.position;
+  updatePhysicsBodies(playerPos);
+  // Step the physics world once to make sure initial overlaps are resolved
+  try { world.step(); } catch (e) { /* ignore if world not ready */ }
 }
 
 // --- Input ---
@@ -835,16 +982,19 @@ function performInteract(actionName) {
     const px = Math.round(intersect.point.x + nx * 0.5);
     const py = Math.round(intersect.point.y + ny * 0.5);
     const pz = Math.round(intersect.point.z + nz * 0.5);
-    addBlock(px, py, pz, item.type);
-    item.count--;
-    if (item.count===0) inventory[hotbarSelected]=null;
+    const placed = addBlock(px, py, pz, item.type);
+    if (placed) {
+      item.count--;
+      if (item.count===0) inventory[hotbarSelected]=null;
+    }
     renderInventory();
   }
 }
 
 // --- Main Loop ---
 let lastCullingUpdate = 0;
-const CULLING_UPDATE_INTERVAL = 500;
+// Increase culling/physics update interval to reduce jitter from frequent body creation
+const CULLING_UPDATE_INTERVAL = 1000;
 let lastRaycasterUpdate = 0;
 const RAYCASTER_UPDATE_INTERVAL = 50; // 20fps for highlight is plenty
 let lastSkyUpdate = 0;
@@ -898,8 +1048,8 @@ function animate() {
     lastSkyUpdate = time;
   }
 
-  // Update shadow map only every 2 seconds
-  if (!animate._lastShadow || time - animate._lastShadow > 2000) {
+  // Update shadow map infrequently to reduce spikes (every 5s)
+  if (!animate._lastShadow || time - animate._lastShadow > 5000) {
     renderer.shadowMap.needsUpdate = true;
     animate._lastShadow = time;
   }
