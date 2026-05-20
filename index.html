@@ -1,358 +1,155 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Three.js Minecraft</title>
-    <link rel="stylesheet" href="style.css" />
-
-    <!-- Three.js Import Map (unchanged) -->
+    <link rel="stylesheet" href="style.css">
+    
+    <!-- Three.js Import Map -->
     <script type="importmap">
-      {
+    {
         "imports": {
-          "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
-          "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
-          "@dimforge/rapier3d-compat": "https://unpkg.com/@dimforge/rapier3d-compat@0.12.0/rapier.es.js",
-          "simplex-noise": "https://esm.sh/simplex-noise@2.4.0"
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+            "@dimforge/rapier3d-compat": "https://unpkg.com/@dimforge/rapier3d-compat@0.12.0/rapier.es.js",
+            "simplex-noise": "https://esm.sh/simplex-noise@2.4.0"
         }
-      }
+    }
     </script>
-  </head>
-  <body>
+</head>
+<body>
     <div id="ui-layer">
-      <div id="crosshair">+</div>
-      <div id="hotbar-name"></div>
-      <div id="hotbar">
-        <!-- Dynamically populated -->
-      </div>
-
-      <div
-        id="inventory-screen"
-        class="menu-container"
-        style="
-          display: none;
-          position: absolute;
-          top: 50%;
-          left: 50%;
-          transform: translate(-50%, -50%);
-          background: #c6c6c6;
-          border: 4px solid #555;
-          padding: 20px;
-          z-index: 20;
-          color: black;
-          text-shadow: none;
-          width: auto;
-          pointer-events: auto;
-        "
-      >
-        <h2
-          style="
-            margin-top: 0;
-            text-align: left;
-            font-size: 20px;
-            color: #333;
-            text-shadow: none;
-          "
-        >
-          Inventory
-        </h2>
-        <div
-          id="inventory-grid"
-          style="
-            display: grid;
-            grid-template-columns: repeat(9, 44px);
-            grid-template-rows: repeat(3, 44px);
-            gap: 4px;
-            margin-bottom: 20px;
-          "
-        >
-          <!-- Dynamically populated -->
+        <div id="crosshair">+</div>
+        <div id="hotbar-name"></div>
+        <div id="hotbar">
+            <!-- Dynamically populated -->
         </div>
-        <div
-          id="inventory-hotbar-grid"
-          style="
-            display: grid;
-            grid-template-columns: repeat(9, 44px);
-            gap: 4px;
-          "
-        >
-          <!-- Dynamically populated -->
+
+        <div id="inventory-screen" class="menu-container" style="display: none; position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: #c6c6c6; border: 4px solid #555; padding: 20px; z-index: 20; color: black; text-shadow: none; width: auto; pointer-events: auto;">
+            <h2 style="margin-top: 0; text-align: left; font-size: 20px; color: #333; text-shadow: none;">Inventory</h2>
+            <div id="inventory-grid" style="display: grid; grid-template-columns: repeat(9, 44px); grid-template-rows: repeat(3, 44px); gap: 4px; margin-bottom: 20px;">
+                <!-- Dynamically populated -->
+            </div>
+            <div id="inventory-hotbar-grid" style="display: grid; grid-template-columns: repeat(9, 44px); gap: 4px;">
+                <!-- Dynamically populated -->
+            </div>
+            <p style="font-size: 14px; margin-bottom: 0; color: #555;">Click an item to move it to the selected hotbar slot.</p>
         </div>
-        <p style="font-size: 14px; margin-bottom: 0; color: #555">
-          Click an item to move it to the selected hotbar slot.
-        </p>
-      </div>
+        
+        <div id="blocker">
+            <div id="pause-screen-layer">
+                <!-- MAIN START / PAUSE MENU -->
+                <div id="menu-main" class="menu-container">
+                    <h1 id="menu-title">Game Paused</h1>
+                    <button class="mc-button" id="btn-resume">Back to Game</button>
+                    <button class="mc-button" id="btn-options">Options</button>
+                    <button class="mc-button" id="btn-exit">Save and Quit to Title</button>
+                </div>
 
-      <div id="blocker">
-        <div id="pause-screen-layer">
-          <!-- MAIN START / PAUSE MENU -->
-          <div id="menu-main" class="menu-container">
-            <h1 id="menu-title">Game Paused</h1>
-            <button class="mc-button" id="btn-resume">Back to Game</button>
-            <button class="mc-button" id="btn-options">Options</button>
-            <button class="mc-button" id="btn-exit">
-              Save and Quit to Title
-            </button>
-          </div>
+                <!-- OPTIONS MENU -->
+                <div id="menu-options" class="menu-container" style="display: none;">
+                    <h1>Options</h1>
+                    <button class="mc-button" id="btn-graphics">Graphics...</button>
+                    <button class="mc-button" id="btn-controls">Controls...</button>
+                    <button class="mc-button" id="btn-options-done">Done</button>
+                </div>
 
-          <!-- OPTIONS MENU -->
-          <div id="menu-options" class="menu-container" style="display: none">
-            <h1>Options</h1>
-            <button class="mc-button" id="btn-graphics">Graphics...</button>
-            <button class="mc-button" id="btn-controls">Controls...</button>
-            <button class="mc-button" id="btn-options-done">Done</button>
-          </div>
+                <!-- GRAPHICS MENU -->
+                <div id="menu-graphics" class="menu-container" style="display: none; width: 400px;">
+                    <h1>Graphics Settings</h1>
+                    <div class="row" style="margin-bottom: 15px;">
+                        <span style="color: white; margin-right: 10px;">Render Distance:</span>
+                        <input type="range" id="graphics-render-distance" min="2" max="16" value="6" step="1">
+                        <span style="color: white; margin-left: 10px;" id="lbl-render-distance">6 chunks</span>
+                    </div>
+                    <div class="row" style="margin-bottom: 15px; display: flex; justify-content: space-between;">
+                        <button class="mc-button sm-button" id="btn-toggle-quality" style="width: 48%;">Graphics: Fast</button>
+                        <button class="mc-button sm-button" id="btn-toggle-shadows" style="width: 48%;">Shadows: OFF</button>
+                    </div>
+                    <div class="row" style="margin-bottom: 15px; display: flex; justify-content: space-between;">
+                        <button class="mc-button sm-button" id="btn-toggle-adaptive-res" style="width: 48%;">Adaptive Res: ON</button>
+                    </div>
+                    <button class="mc-button" id="btn-graphics-done" style="margin-top: 20px;">Done</button>
+                </div>
 
-          <!-- GRAPHICS MENU -->
-          <div
-            id="menu-graphics"
-            class="menu-container"
-            style="display: none; width: 400px"
-          >
-            <h1>Graphics Settings</h1>
-            <div class="row" style="margin-bottom: 15px">
-              <span style="color: white; margin-right: 10px"
-                >Render Distance:</span
-              >
-              <input
-                type="range"
-                id="graphics-render-distance"
-                min="2"
-                max="16"
-                value="6"
-                step="1"
-              />
-              <span
-                style="color: white; margin-left: 10px"
-                id="lbl-render-distance"
-                >6 chunks</span
-              >
+                <!-- CONTROLS MENU -->
+                <div id="menu-controls" class="menu-container" style="display: none; max-height: 80vh; overflow-y: auto; padding: 10px;">
+                    <h1>Controls</h1>
+                    <div class="keybind-row">
+                        <span>Walk Forwards</span>
+                        <button class="mc-button sm-button keybind-btn" data-action="forward">W</button>
+                    </div>
+                    <div class="keybind-row">
+                        <span>Walk Backwards</span>
+                        <button class="mc-button sm-button keybind-btn" data-action="backward">S</button>
+                    </div>
+                    <div class="keybind-row">
+                        <span>Strafe Left</span>
+                        <button class="mc-button sm-button keybind-btn" data-action="left">A</button>
+                    </div>
+                    <div class="keybind-row">
+                        <span>Strafe Right</span>
+                        <button class="mc-button sm-button keybind-btn" data-action="right">D</button>
+                    </div>
+                    <div class="keybind-row">
+                        <span>Jump</span>
+                        <button class="mc-button sm-button keybind-btn" data-action="jump">SPACE</button>
+                    </div>
+                    <div class="keybind-row">
+                        <span>Break Block</span>
+                        <button class="mc-button sm-button keybind-btn" data-action="breakBlock">Click L</button>
+                    </div>
+                    <div class="keybind-row">
+                        <span>Place Block</span>
+                        <button class="mc-button sm-button keybind-btn" data-action="placeBlock">Click R</button>
+                    </div>
+                    <div class="keybind-row">
+                        <span>Hotbar Slot 1</span>
+                        <button class="mc-button sm-button keybind-btn" data-action="slot1">1</button>
+                    </div>
+                    <div class="keybind-row">
+                        <span>Hotbar Slot 2</span>
+                        <button class="mc-button sm-button keybind-btn" data-action="slot2">2</button>
+                    </div>
+                    <div class="keybind-row">
+                        <span>Hotbar Slot 3</span>
+                        <button class="mc-button sm-button keybind-btn" data-action="slot3">3</button>
+                    </div>
+                    <div class="keybind-row">
+                        <span>Hotbar Slot 4</span>
+                        <button class="mc-button sm-button keybind-btn" data-action="slot4">4</button>
+                    </div>
+                    <div class="keybind-row">
+                        <span>Hotbar Slot 5</span>
+                        <button class="mc-button sm-button keybind-btn" data-action="slot5">5</button>
+                    </div>
+                    <div class="keybind-row">
+                        <span>Hotbar Slot 6</span>
+                        <button class="mc-button sm-button keybind-btn" data-action="slot6">6</button>
+                    </div>
+                    <div class="keybind-row">
+                        <span>Hotbar Slot 7</span>
+                        <button class="mc-button sm-button keybind-btn" data-action="slot7">7</button>
+                    </div>
+                    <div class="keybind-row">
+                        <span>Hotbar Slot 8</span>
+                        <button class="mc-button sm-button keybind-btn" data-action="slot8">8</button>
+                    </div>
+                    <div class="keybind-row">
+                        <span>Hotbar Slot 9</span>
+                        <button class="mc-button sm-button keybind-btn" data-action="slot9">9</button>
+                    </div>
+                    <div class="keybind-row">
+                        <span>Inventory</span>
+                        <button class="mc-button sm-button keybind-btn" data-action="inventory">E</button>
+                    </div>
+                    <button class="mc-button" id="btn-controls-done" style="margin-top: 20px;">Done</button>
+                </div>
             </div>
-            <div
-              class="row"
-              style="
-                margin-bottom: 15px;
-                display: flex;
-                justify-content: space-between;
-              "
-            >
-              <button
-                class="mc-button sm-button"
-                id="btn-toggle-quality"
-                style="width: 48%"
-              >
-                Graphics: Fast
-              </button>
-              <button
-                class="mc-button sm-button"
-                id="btn-toggle-shadows"
-                style="width: 48%"
-              >
-                Shadows: OFF
-              </button>
-            </div>
-            <div
-              class="row"
-              style="
-                margin-bottom: 15px;
-                display: flex;
-                justify-content: space-between;
-              "
-            >
-              <button
-                class="mc-button sm-button"
-                id="btn-toggle-adaptive-res"
-                style="width: 48%"
-              >
-                Adaptive Res: ON
-              </button>
-            </div>
-            <button
-              class="mc-button"
-              id="btn-graphics-done"
-              style="margin-top: 20px"
-            >
-              Done
-            </button>
-          </div>
-
-          <!-- CONTROLS MENU -->
-          <div
-            id="menu-controls"
-            class="menu-container"
-            style="
-              display: none;
-              max-height: 80vh;
-              overflow-y: auto;
-              padding: 10px;
-            "
-          >
-            <h1>Controls</h1>
-            <div class="keybind-row">
-              <span>Walk Forwards</span>
-              <button
-                class="mc-button sm-button keybind-btn"
-                data-action="forward"
-              >
-                W
-              </button>
-            </div>
-            <div class="keybind-row">
-              <span>Walk Backwards</span>
-              <button
-                class="mc-button sm-button keybind-btn"
-                data-action="backward"
-              >
-                S
-              </button>
-            </div>
-            <div class="keybind-row">
-              <span>Strafe Left</span>
-              <button
-                class="mc-button sm-button keybind-btn"
-                data-action="left"
-              >
-                A
-              </button>
-            </div>
-            <div class="keybind-row">
-              <span>Strafe Right</span>
-              <button
-                class="mc-button sm-button keybind-btn"
-                data-action="right"
-              >
-                D
-              </button>
-            </div>
-            <div class="keybind-row">
-              <span>Jump</span>
-              <button
-                class="mc-button sm-button keybind-btn"
-                data-action="jump"
-              >
-                SPACE
-              </button>
-            </div>
-            <div class="keybind-row">
-              <span>Break Block</span>
-              <button
-                class="mc-button sm-button keybind-btn"
-                data-action="breakBlock"
-              >
-                Click L
-              </button>
-            </div>
-            <div class="keybind-row">
-              <span>Place Block</span>
-              <button
-                class="mc-button sm-button keybind-btn"
-                data-action="placeBlock"
-              >
-                Click R
-              </button>
-            </div>
-            <div class="keybind-row">
-              <span>Hotbar Slot 1</span>
-              <button
-                class="mc-button sm-button keybind-btn"
-                data-action="slot1"
-              >
-                1
-              </button>
-            </div>
-            <div class="keybind-row">
-              <span>Hotbar Slot 2</span>
-              <button
-                class="mc-button sm-button keybind-btn"
-                data-action="slot2"
-              >
-                2
-              </button>
-            </div>
-            <div class="keybind-row">
-              <span>Hotbar Slot 3</span>
-              <button
-                class="mc-button sm-button keybind-btn"
-                data-action="slot3"
-              >
-                3
-              </button>
-            </div>
-            <div class="keybind-row">
-              <span>Hotbar Slot 4</span>
-              <button
-                class="mc-button sm-button keybind-btn"
-                data-action="slot4"
-              >
-                4
-              </button>
-            </div>
-            <div class="keybind-row">
-              <span>Hotbar Slot 5</span>
-              <button
-                class="mc-button sm-button keybind-btn"
-                data-action="slot5"
-              >
-                5
-              </button>
-            </div>
-            <div class="keybind-row">
-              <span>Hotbar Slot 6</span>
-              <button
-                class="mc-button sm-button keybind-btn"
-                data-action="slot6"
-              >
-                6
-              </button>
-            </div>
-            <div class="keybind-row">
-              <span>Hotbar Slot 7</span>
-              <button
-                class="mc-button sm-button keybind-btn"
-                data-action="slot7"
-              >
-                7
-              </button>
-            </div>
-            <div class="keybind-row">
-              <span>Hotbar Slot 8</span>
-              <button
-                class="mc-button sm-button keybind-btn"
-                data-action="slot8"
-              >
-                8
-              </button>
-            </div>
-            <div class="keybind-row">
-              <span>Hotbar Slot 9</span>
-              <button
-                class="mc-button sm-button keybind-btn"
-                data-action="slot9"
-              >
-                9
-              </button>
-            </div>
-            <div class="keybind-row">
-              <span>Inventory</span>
-              <button
-                class="mc-button sm-button keybind-btn"
-                data-action="inventory"
-              >
-                E
-              </button>
-            </div>
-            <button
-              class="mc-button"
-              id="btn-controls-done"
-              style="margin-top: 20px"
-            >
-              Done
-            </button>
-          </div>
         </div>
-      </div>
     </div>
-
+    
     <script type="module" src="main.js"></script>
-  </body>
+</body>
 </html>
