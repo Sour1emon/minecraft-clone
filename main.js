@@ -29,7 +29,7 @@ const velocity = new THREE.Vector3();
 let lastInventoryUpdate = 0;
 const INVENTORY_UPDATE_THROTTLE = 50;
 // Performance settings: enable `lowQualityMode` to prioritize smoothness over visual fidelity
-const PERFORMANCE = { lowQualityMode: true };
+const PERFORMANCE = { lowQualityMode: true, shadows: false, adaptiveRes: true };
 const BASE_PIXEL_RATIO = Math.min(window.devicePixelRatio, PERFORMANCE.lowQualityMode ? 1.25 : 2);
 let currentPixelRatio = BASE_PIXEL_RATIO;
 let targetPixelRatio = BASE_PIXEL_RATIO;
@@ -61,7 +61,7 @@ const blockPhysics = new Map();
 const materialCache = new Map();
 // Instanced rendering: per-block-type instanced meshes
 const instancedMeshes = new Map();
-PERFORMANCE.instancing = true;
+PERFORMANCE.instancing = false; // Disable global instancing, standard face-culled chunkMeshes are vastly more efficient
 
 // Preallocated per-frame vectors
 const _right = new THREE.Vector3();
@@ -136,10 +136,6 @@ function generateTexture(type) {
 // Pre-generate all textures up front so there's no stutter on first block of each type
 const TEX_TYPES = ["dirt","stone","grass_top","grass_side","wood_top","wood_side","leaves","sand","brick","glass"];
 // Defer texture pre-generation until after init to avoid blocking startup
-// (we still lazily generate on-demand inside getChunkMaterial)
-// TEX_TYPES.forEach(generateTexture);
-iconUris["grass"] = iconUris["grass_side"];
-iconUris["wood"] = iconUris["wood_side"];
 
 // --- Chunk Mesh Builder ---
 // Face definitions: [normal dx,dy,dz], [4 vertices as offsets from block center], [uv coords]
@@ -477,7 +473,6 @@ function rebuildVisibleObjects() {
     if (dist < renderDistanceBlocks + CHUNK_SIZE) {
       // frustum cull each mesh by its bounding box when available
       for (const mesh of meshes) {
-        if (mesh.userData.isTransparent) continue;
         if (mesh.geometry && mesh.geometry.boundingBox === null) mesh.geometry.computeBoundingBox();
         if (mesh.geometry && mesh.geometry.boundingBox) {
           const box = mesh.geometry.boundingBox.clone().applyMatrix4(mesh.matrixWorld);
@@ -489,7 +484,6 @@ function rebuildVisibleObjects() {
   }
   // Include instanced meshes in the raycast list (cull by their stored bounding boxes)
   for (const [key, im] of instancedMeshes) {
-    if (im.userData && im.userData.isTransparent) continue;
     const box = im.userData && im.userData.boundingBox ? im.userData.boundingBox.clone() : null;
     if (box) {
       if (!frustum.intersectsBox(box)) continue;
@@ -514,6 +508,19 @@ function updatePhysicsBodies(playerPos) {
         const [wx, wy, wz] = posKey.split(",").map(Number);
         const dist = Math.hypot(wx - playerPos.x, wy - playerPos.y, wz - playerPos.z);
         if (dist < PHYSICS_CULLING_DISTANCE) {
+          // Only create physics for exposed blocks to save performance
+          const isBlockOpaque = (bx, by, bz) => {
+            const t = blockMap.get(`${bx},${by},${bz}`);
+            return t && !TRANSPARENT_TYPES.has(t);
+          };
+          const isExposed = !isBlockOpaque(wx+1, wy, wz) ||
+                            !isBlockOpaque(wx-1, wy, wz) ||
+                            !isBlockOpaque(wx, wy+1, wz) ||
+                            !isBlockOpaque(wx, wy-1, wz) ||
+                            !isBlockOpaque(wx, wy, wz+1) ||
+                            !isBlockOpaque(wx, wy, wz-1);
+          if (!isExposed) continue;
+
           const rb = world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(wx, wy, wz));
           world.createCollider(RAPIER.ColliderDesc.cuboid(0.5, 0.5, 0.5), rb);
           blockPhysics.set(posKey, rb);
@@ -522,11 +529,24 @@ function updatePhysicsBodies(playerPos) {
     }
   }
 
-  // Remove physics for blocks now out of range
+  // Remove physics for blocks now out of range or no longer exposed
   for (const [posKey, rb] of blockPhysics) {
     const [x, y, z] = posKey.split(",").map(Number);
     const dist = Math.hypot(x - playerPos.x, y - playerPos.y, z - playerPos.z);
-    if (dist >= PHYSICS_CULLING_DISTANCE) {
+    
+    // Also cleanup blocks that became completely surrounded (e.g. from placing blocks)
+    const isBlockOpaque = (bx, by, bz) => {
+      const t = blockMap.get(`${bx},${by},${bz}`);
+      return t && !TRANSPARENT_TYPES.has(t);
+    };
+    const isExposed = !isBlockOpaque(x+1, y, z) ||
+                      !isBlockOpaque(x-1, y, z) ||
+                      !isBlockOpaque(x, y+1, z) ||
+                      !isBlockOpaque(x, y-1, z) ||
+                      !isBlockOpaque(x, y, z+1) ||
+                      !isBlockOpaque(x, y, z-1);
+
+    if (dist >= PHYSICS_CULLING_DISTANCE || !isExposed) {
       world.removeRigidBody(rb);
       blockPhysics.delete(posKey);
     }
@@ -727,7 +747,7 @@ async function init() {
 
   const rendererInst = new THREE.WebGLRenderer({ antialias: !PERFORMANCE.lowQualityMode, powerPreference: "high-performance" });
   // Disable expensive shadow rendering in low quality mode to improve frame stability
-  rendererInst.shadowMap.enabled = PERFORMANCE.lowQualityMode ? false : true;
+  rendererInst.shadowMap.enabled = PERFORMANCE.shadows;
   rendererInst.shadowMap.type = THREE.PCFShadowMap;
   rendererInst.shadowMap.autoUpdate = false;
   rendererInst.shadowMap.needsUpdate = true;
@@ -761,6 +781,33 @@ async function init() {
 
   const sliderRenderDist = document.getElementById("graphics-render-distance");
   const lblRenderDist = document.getElementById("lbl-render-distance");
+  
+  const btnQuality = document.getElementById("btn-toggle-quality");
+  const btnShadows = document.getElementById("btn-toggle-shadows");
+  const btnAdaptive = document.getElementById("btn-toggle-adaptive-res");
+
+  btnQuality.addEventListener("click", () => {
+    PERFORMANCE.lowQualityMode = !PERFORMANCE.lowQualityMode;
+    btnQuality.innerText = `Graphics: ${PERFORMANCE.lowQualityMode ? "Fast" : "Fancy"}`;
+    // Re-create materials with different antialiasing/filtering? Not instantly possible without reloading, but we can set UI.
+  });
+
+  btnShadows.addEventListener("click", () => {
+    PERFORMANCE.shadows = !PERFORMANCE.shadows;
+    btnShadows.innerText = `Shadows: ${PERFORMANCE.shadows ? "ON" : "OFF"}`;
+    renderer.shadowMap.enabled = PERFORMANCE.shadows;
+    scene.traverse(child => { if(child.material) child.material.needsUpdate=true; });
+  });
+
+  btnAdaptive.addEventListener("click", () => {
+    PERFORMANCE.adaptiveRes = !PERFORMANCE.adaptiveRes;
+    btnAdaptive.innerText = `Adaptive Res: ${PERFORMANCE.adaptiveRes ? "ON" : "OFF"}`;
+    if (!PERFORMANCE.adaptiveRes) {
+      currentPixelRatio = BASE_PIXEL_RATIO;
+      renderer.setPixelRatio(currentPixelRatio);
+    }
+  });
+
   sliderRenderDist.min = "2";
   sliderRenderDist.max = "16";
   sliderRenderDist.step = "1";
@@ -901,7 +948,9 @@ function updateHotbarDisplay() {
     const slot = document.createElement("div");
     slot.className = `slot ${i===hotbarSelected?"active":""}`;
     if (item) {
-      slot.style.backgroundImage = `url(${iconUris[item.type]})`;
+      const displayType = item.type === "grass" ? "grass_side" : (item.type === "wood" ? "wood_side" : item.type);
+      if (!iconUris[displayType]) generateTexture(displayType);
+      slot.style.backgroundImage = `url(${iconUris[displayType]})`;
       const c = document.createElement("div");
       c.className="slot-count"; c.innerText=item.count;
       slot.appendChild(c);
@@ -922,7 +971,9 @@ function renderInventoryScreen() {
     const slot = document.createElement("div");
     slot.className = `inv-slot ${selectedInventorySlot===i?"active":""}`;
     if (item) {
-      slot.style.backgroundImage=`url(${iconUris[item.type]})`;
+      const displayType = item.type === "grass" ? "grass_side" : (item.type === "wood" ? "wood_side" : item.type);
+      if (!iconUris[displayType]) generateTexture(displayType);
+      slot.style.backgroundImage=`url(${iconUris[displayType]})`;
       const c=document.createElement("div"); c.className="inv-slot-count"; c.innerText=item.count;
       slot.appendChild(c);
     }
@@ -968,6 +1019,8 @@ function performInteract(actionName) {
       // Don't break below y = -2 (bedrock floor)
       if (by <= -2) return;
       removeBlock(posKey);
+      // Force instant physics update so we don't fall through
+      updatePhysicsBodies(camera.position);
       // Add to inventory
       let added = false;
       for (let i=0;i<36;i++) {
@@ -984,6 +1037,7 @@ function performInteract(actionName) {
     const pz = Math.round(intersect.point.z + nz * 0.5);
     const placed = addBlock(px, py, pz, item.type);
     if (placed) {
+      updatePhysicsBodies(camera.position); // instant physics
       item.count--;
       if (item.count===0) inventory[hotbarSelected]=null;
     }
@@ -1015,7 +1069,7 @@ function animate() {
   if (timeOfDay > Math.PI * 2) timeOfDay -= Math.PI * 2;
 
   // Adaptive internal resolution: lower pixel ratio on sustained spikes, restore when stable.
-  if (time - lastDprEval > 1000) {
+  if (PERFORMANCE.adaptiveRes && time - lastDprEval > 1000) {
     if (smoothedFrameMs > 23) {
       targetPixelRatio = Math.max(0.7, targetPixelRatio - 0.1);
     } else if (smoothedFrameMs < 16) {
@@ -1054,7 +1108,7 @@ function animate() {
     animate._lastShadow = time;
   }
 
-  // Periodic physics + visible list update
+  // Periodic physics + chunk visibility logic
   if (time - lastCullingUpdate > CULLING_UPDATE_INTERVAL) {
     updatePhysicsBodies(camera.position);
 
@@ -1062,14 +1116,19 @@ function animate() {
     const playerChunkZ = Math.floor(camera.position.z / CHUNK_SIZE);
     const movedChunk = playerChunkX !== lastPlayerChunkX || playerChunkZ !== lastPlayerChunkZ;
     ensureChunksAroundPlayer(camera.position);
-    if (needsVisibleRebuild || movedChunk) {
-      rebuildVisibleObjects();
-      needsVisibleRebuild = false;
+    if (movedChunk) {
+      needsVisibleRebuild = true;
       lastPlayerChunkX = playerChunkX;
       lastPlayerChunkZ = playerChunkZ;
     }
 
     lastCullingUpdate = time;
+  }
+
+  // Instant visibility rebuild when dirty (removes block breaking raycast lag)
+  if (needsVisibleRebuild) {
+    rebuildVisibleObjects();
+    needsVisibleRebuild = false;
   }
 
   if (controls.isLocked) {
